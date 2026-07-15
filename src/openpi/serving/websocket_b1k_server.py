@@ -9,6 +9,7 @@ import traceback
 import torch
 import websockets.asyncio.server as _server
 import websockets
+import copy
 from copy import deepcopy
 from typing import Any, Optional
 
@@ -52,9 +53,25 @@ class WebsocketPolicyServer:
         ) as server:
             await server.serve_forever()
 
+    @staticmethod
+    def _clear_policy_state(policy) -> None:
+        """Reset only the per-connection receding-horizon bookkeeping (NOT the shared jax model)."""
+        policy.batch_size = None
+        policy.action_buffer = None
+        policy.sequence_indices = None
+        policy.sequence_lengths = None
+        policy.num_active_sequences = None
+        policy.step_counter = None
+
     async def _handler(self, websocket):
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = Packer()
+
+        # Per-connection policy: shares the heavy (stateless) jax model but keeps its own
+        # receding-horizon buffers/step counter. Without this, concurrent eval env slots all share the
+        # single self._policy and corrupt each other's action plans (only slot 0 stays coherent).
+        conn_policy = copy.copy(self._policy)
+        self._clear_policy_state(conn_policy)
 
         await websocket.send(packer.pack(self._metadata))
 
@@ -64,13 +81,13 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 result = unpackb(await websocket.recv(), strict_map_key=False)
                 if "reset" in result:
-                    self._policy.reset()
+                    self._clear_policy_state(conn_policy)
                     continue
 
                 obs = deepcopy(result)
 
                 infer_time = time.monotonic()
-                action = self._policy.act(obs)
+                action = conn_policy.act(obs)
                 infer_time = time.monotonic() - infer_time
 
                 action = {
