@@ -132,10 +132,11 @@ class B1KPolicyWrapper:
 
         if needs_inference.any():
             indices_needing_inference = np.where(needs_inference)[0]
-            # Create sub-batch for elements that need inference
-            action = []
-            for i in indices_needing_inference:
-                action.append(self.policy.infer(input_batch[i]))
+            # Batched inference: one model forward over all envs that need a replan, instead of one
+            # forward per env. process_input already returns a per-env list, so we just gather the
+            # sub-batch and hand it to the policy's batched entry point.
+            sub_batch = [input_batch[i] for i in indices_needing_inference]
+            action = self.policy.infer_batch(sub_batch)
             target_action = np.array([a["actions"].copy() for a in action])  # (sub_batch_size, T, action_dim)
 
             # Initialize buffers on first inference
@@ -172,10 +173,8 @@ class B1KPolicyWrapper:
 
         # Initialize buffers on first call
         if self.action_buffer is None:
-            # Need to infer once to get action_dim
-            action = []
-            for i in range(batch_size):
-                action.append(self.policy.infer(input_batch[i]))
+            # Need to infer once to get action_dim (batched over all envs)
+            action = self.policy.infer_batch(input_batch)
             target_action = np.array([a["actions"].copy() for a in action])  # (B, T, action_dim)
             action_dim = target_action.shape[2]
             self._ensure_batch_initialized(batch_size, action_dim)
@@ -192,10 +191,9 @@ class B1KPolicyWrapper:
         if needs_replan.any():
             indices_needing_replan = np.where(needs_replan)[0]
 
-            # Run inference only on sub-batch
-            action = []
-            for i in indices_needing_replan:
-                action.append(self.policy.infer(input_batch[i]))
+            # Run inference only on sub-batch (one batched model forward)
+            sub_batch = [input_batch[i] for i in indices_needing_replan]
+            action = self.policy.infer_batch(sub_batch)
             target_action = np.array([a["actions"].copy() for a in action])  # (B, T, action_dim)
 
             # Add new sequences (vectorized where possible)
@@ -280,9 +278,7 @@ class B1KPolicyWrapper:
         batched = input_obs[f"{self.robot.name}::proprio"].ndim != 1
         input_batch = self.process_input(input_obs)
         batch_size = len(input_batch)
-        action = []
-        for i in range(batch_size):
-            action.append(self.policy.infer(input_batch[i]))
+        action = self.policy.infer_batch(input_batch)  # one batched model forward over all envs
         target_action = np.array([a["actions"].copy() for a in action])  # (B, T, action_dim)
         action_dim = target_action.shape[2]
 

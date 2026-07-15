@@ -105,6 +105,57 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    def infer_batch(self, obs_list: list[dict], *, noise: np.ndarray | None = None) -> list[dict]:
+        """Batched variant of `infer`.
+
+        Runs a SINGLE model forward over `len(obs_list)` observations instead of one forward per
+        observation. The input/output transforms assume a single, unbatched example, so they are
+        applied per-example; only the (expensive) model call is batched. Returns a list of per-example
+        output dicts aligned with `obs_list`. All observations must share the same structure/shapes.
+        """
+        if not obs_list:
+            return []
+
+        # Apply the single-example input transforms to each observation, then stack into one batch.
+        transformed = [self._input_transform(jax.tree.map(lambda x: x, obs)) for obs in obs_list]
+        if not self._is_pytorch_model:
+            inputs = jax.tree.map(lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0), *transformed)
+            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+        else:
+            inputs = jax.tree.map(
+                lambda *xs: torch.from_numpy(np.stack([np.asarray(x) for x in xs], axis=0)).to(self._pytorch_device),
+                *transformed,
+            )
+            sample_rng_or_pytorch_device = self._pytorch_device
+
+        # Prepare kwargs for sample_actions. If provided, noise is expected to already be batched
+        # as (batch, action_horizon, action_dim).
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+            sample_kwargs["noise"] = noise
+
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
+        batched_outputs = {
+            "state": inputs["state"],
+            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+        }
+        model_time = time.monotonic() - start_time
+        if self._is_pytorch_model:
+            batched_outputs = jax.tree.map(lambda x: np.asarray(x.detach().cpu()), batched_outputs)
+        else:
+            batched_outputs = jax.tree.map(np.asarray, batched_outputs)
+
+        # Split the batch back into per-example dicts and apply the single-example output transforms.
+        results = []
+        for i in range(len(obs_list)):
+            example = jax.tree.map(lambda x: x[i], batched_outputs)
+            example = self._output_transform(example)
+            example["policy_timing"] = {"infer_ms": model_time * 1000}
+            results.append(example)
+        return results
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
