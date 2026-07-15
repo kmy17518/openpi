@@ -1,23 +1,26 @@
 import asyncio
+import copy
+from copy import deepcopy
 import functools
 import http
 import logging
-import msgpack
-import numpy as np
 import time
 import traceback
-import torch
-import websockets.asyncio.server as _server
-import websockets
-import copy
-from copy import deepcopy
 from typing import Any, Optional
+
+import msgpack
+import numpy as np
+import torch
+import websockets
+import websockets.asyncio.server as _server
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
 __all__ = ["WebsocketPolicyServer"]
+
+ACTION_CHUNK_REQUEST_KEY = "__action_chunk_size__"
 
 
 class WebsocketPolicyServer:
@@ -56,12 +59,23 @@ class WebsocketPolicyServer:
     @staticmethod
     def _clear_policy_state(policy) -> None:
         """Reset only the per-connection receding-horizon bookkeeping (NOT the shared jax model)."""
-        policy.batch_size = None
-        policy.action_buffer = None
-        policy.sequence_indices = None
-        policy.sequence_lengths = None
-        policy.num_active_sequences = None
-        policy.step_counter = None
+        policy.reset_connection_state()
+
+    @staticmethod
+    def _validate_action_chunk_request(policy, action_chunk_size: int) -> None:
+        if action_chunk_size <= 1:
+            return
+        if policy.control_mode != "receding_horizon":
+            raise ValueError("Action-chunk replay is only exact for receding_horizon control")
+        if action_chunk_size > policy.action_horizon:
+            raise ValueError(
+                f"Requested action chunk {action_chunk_size} crosses the fresh-observation replanning "
+                f"boundary at {policy.action_horizon}"
+            )
+        if action_chunk_size > policy.max_len:
+            raise ValueError(
+                f"Requested action chunk {action_chunk_size} exceeds model action sequence length {policy.max_len}"
+            )
 
     async def _handler(self, websocket):
         logger.info(f"Connection from {websocket.remote_address} opened")
@@ -84,15 +98,20 @@ class WebsocketPolicyServer:
                     self._clear_policy_state(conn_policy)
                     continue
 
+                action_chunk_size = max(1, int(result.pop(ACTION_CHUNK_REQUEST_KEY, 1)))
+                self._validate_action_chunk_request(conn_policy, action_chunk_size)
                 obs = deepcopy(result)
 
                 infer_time = time.monotonic()
-                action = conn_policy.act(obs)
+                actions = [conn_policy.act(obs) for _ in range(action_chunk_size)]
                 infer_time = time.monotonic() - infer_time
 
+                action_arrays = [action.cpu().numpy() for action in actions]
                 action = {
-                    "action": action.cpu().numpy(),
+                    "action": action_arrays[0],
                 }
+                if action_chunk_size > 1:
+                    action["action_chunk"] = np.stack(action_arrays, axis=-2)
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }
