@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import inspect
 import logging
 import pathlib
 import time
@@ -61,8 +62,9 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
+            self._sample_actions_accepts_noise = "noise" in inspect.signature(model.sample_actions).parameters
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
-            self._rng = rng or jax.random.key(0)
+            self._rng = jax.random.key(0) if rng is None else rng
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -115,12 +117,24 @@ class Policy(BasePolicy):
         """
         if not obs_list:
             return []
+        if (
+            not self._is_pytorch_model
+            and not self._sample_actions_accepts_noise
+            and float(self._sample_kwargs.get("temperature", 0.0)) > 0.0
+        ):
+            # A stochastic autoregressive model accepts only one RNG key for the whole batch. Running it
+            # batched would change the original one-key-per-example random stream, so retain the reference path.
+            return [self.infer(obs) for obs in obs_list]
 
         # Apply the single-example input transforms to each observation, then stack into one batch.
         transformed = [self._input_transform(jax.tree.map(lambda x: x, obs)) for obs in obs_list]
         if not self._is_pytorch_model:
             inputs = jax.tree.map(lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0), *transformed)
-            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+            sample_rngs = []
+            for _ in obs_list:
+                self._rng, sample_rng = jax.random.split(self._rng)
+                sample_rngs.append(sample_rng)
+            sample_rng_or_pytorch_device = sample_rngs[-1]
         else:
             inputs = jax.tree.map(
                 lambda *xs: torch.from_numpy(np.stack([np.asarray(x) for x in xs], axis=0)).to(self._pytorch_device),
@@ -131,8 +145,22 @@ class Policy(BasePolicy):
         # Prepare kwargs for sample_actions. If provided, noise is expected to already be batched
         # as (batch, action_horizon, action_dim).
         sample_kwargs = dict(self._sample_kwargs)
+        if noise is None and not self._is_pytorch_model and self._sample_actions_accepts_noise:
+            # Match N sequential infer() calls exactly: each example gets the key it would have received
+            # independently. A single batch RNG changes both this batch and the RNG stream of later calls.
+            noise = jnp.concatenate(
+                [
+                    jax.random.normal(key, (1, self._model.action_horizon, self._model.action_dim))
+                    for key in sample_rngs
+                ],
+                axis=0,
+            )
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+            if noise.ndim == 2 and len(obs_list) == 1:
+                noise = noise[None, ...]
+            if noise.shape[0] != len(obs_list):
+                raise ValueError(f"Batched noise has batch size {noise.shape[0]}, expected {len(obs_list)}")
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
@@ -150,7 +178,7 @@ class Policy(BasePolicy):
         # Split the batch back into per-example dicts and apply the single-example output transforms.
         results = []
         for i in range(len(obs_list)):
-            example = jax.tree.map(lambda x: x[i], batched_outputs)
+            example = jax.tree.map(lambda x, index=i: x[index], batched_outputs)
             example = self._output_transform(example)
             example["policy_timing"] = {"infer_ms": model_time * 1000}
             results.append(example)
@@ -175,7 +203,16 @@ class PolicyRecorder(_base_policy.BasePolicy):
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         results = self._policy.infer(obs)
+        self._record(obs, results)
+        return results
 
+    def infer_batch(self, obs_list: list[dict], *, noise: np.ndarray | None = None) -> list[dict]:
+        results = self._policy.infer_batch(obs_list, noise=noise)
+        for obs, result in zip(obs_list, results, strict=True):
+            self._record(obs, result)
+        return results
+
+    def _record(self, obs: dict, results: dict) -> None:
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")
 
@@ -183,4 +220,3 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step += 1
 
         np.save(output_path, np.asarray(data))
-        return results

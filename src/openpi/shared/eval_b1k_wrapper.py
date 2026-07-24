@@ -1,7 +1,8 @@
 import numpy as np
-import torch
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
+import torch
+
 from openpi.configs.robots import ROBOT_REGISTRY
 
 
@@ -40,13 +41,17 @@ class B1KPolicyWrapper:
         self.step_counter = None  # Shape: (batch,)
 
     def reset(self):
+        self.reset_connection_state()
+        self.policy.reset()
+
+    def reset_connection_state(self):
+        """Clear action-plan bookkeeping without resetting the shared model policy."""
         self.batch_size = None
         self.action_buffer = None
         self.sequence_indices = None
         self.sequence_lengths = None
         self.num_active_sequences = None
         self.step_counter = None
-        self.policy.reset()
 
     def _ensure_batch_initialized(self, batch_size: int, action_dim: int = None):
         """Ensure buffers are initialized for the given batch size."""
