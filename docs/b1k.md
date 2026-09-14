@@ -389,6 +389,58 @@ Recommended 4-GPU command (verified: 2.5–2.7 s/step, i.e. the GPU-bound rate, 
 
 (`train_b1k.sh` passes its own `--batch_size=64` first; the later `--batch_size=512` wins.)
 
+#### Where a large-batch step spends its time, and what was done about it
+
+Profiled with Nsight Systems (the JAX profiler's CUPTI does not support this GPU: `CUPTI_ERROR_INVALID_DEVICE`) on 4× B300 at global batch 2048 (512 per GPU) and 512; the two profiles have the same shape. The step is entirely GPU-bound — kernels cover 10.71 s of a 10.7 s step, no gaps, and the data loader is idle — so batch 2048 is limited by the compiled train step itself, not by input. Per GPU and step, before the changes below:
+
+| Kernel class | Share | Notes |
+|--------------|------:|-------|
+| cuBLAS GEMMs (`cutlass3x_sm100_*`, Blackwell kernels) | 53 % | projections, MLP, attention score/value products; ~1.7 PFLOP/s while running, i.e. close to the part's dense-bf16 peak |
+| XLA fusions (elementwise, transposes, reductions) | 42 % | **29 % of the whole step was five per-layer kernels in the Gemma attention core** (`loop_transpose_fusion`, `input_select_transpose_fusion`, …): XLA laid the fp32 attention scores out as `[B, T, S, G]` with the 8 query heads as the minor axis, so the softmax was a strided reduction and the score/probability tensors — 4 GB per layer at 128 samples — were transposed several times per layer in forward, recompute and backward |
+| NCCL all-reduce | 3–4 % | ~290 small ring all-reduces per step; already overlapped |
+| cuDNN convolution | 2 % | SigLIP patch embedding |
+
+`preferred_element_type=float32` for the scores, full gradient checkpointing (`nn.remat(..., policy=nothing_saveable)`, i.e. every layer's forward is recomputed in the backward pass) and fp32 master weights are all as in upstream openpi and unchanged.
+
+Changes, each measured on a fixed real batch (pure GPU step time, 4 GPUs):
+
+- **KV-head-major attention layouts** (`src/openpi/models/gemma.py`, `Attention.__call__`). The core is now written as `q: B K T G H`, `k, v: B K S H`, `logits = einsum("BKTGH,BKSH->BKTGS")`, mask broadcast `[B 1 T 1 S]`, `einsum("BKTGS,BKSH->BKTGH")`, i.e. the same GEMMs and softmax with the kv-head axis in front. XLA then emits the scores with S minor, the mask + softmax + cast become one fused kernel, and no score-sized tensor is transposed. The attention core's forward+backward at 128 samples × 1001 tokens goes 30 ms → 15 ms per layer. Not bit-identical (cuBLAS chooses different kernels for the new layouts) but exactly as accurate: against an fp32 reference both formulations show max error 0.015 / mean 0.001 on the output and identical error statistics on dq/dk/dv; a 30-step training run reproduces the earlier loss curve to three decimals (0.8661 / 0.9681 / 0.8113 / 0.8737 vs 0.8656 / 0.9681 / 0.8111 / 0.8735). Serving uses the same module. Effect on the whole step: batch 2048 10.54 → 9.35 s (194 → 219 samples/s), batch 512 2.56 → 2.23 s (200 → 229 samples/s); peak memory unchanged (232 vs 235 GiB at 2048).
+- **`--model.max-token-len 144`** (per run; default stays 200). The prompt + discretized-state tokens of the challenge demos use 83–101 of the 200 token slots (the fail-fast check in `create_b1k_dataset` bounds the worst case for `task_name` prompts at 142), and the remaining padding is masked but still multiplied through every layer. 144 shortens the sequence from 1001 to 945 tokens: batch 512 2.23 → 2.14 s/step (240 samples/s), identical loss. It is a pure efficiency knob — padding tokens are masked out and positions are cumulative over valid tokens, so the checkpoint can be served with the default 200. For `task_description` prompts keep the value the check asks for.
+
+Tried and rejected: `jax.nn.dot_product_attention(implementation="cudnn")` (jax 0.5.3's wrapper requires head_dim ≤ 128, Gemma has 256); `--xla_gpu_enable_cublaslt=true` (GELU epilogue fusion — crashes with a bus error on this platform); `--xla_gpu_enable_latency_hiding_scheduler`, `--xla_gpu_all_reduce_combine_threshold_bytes` (≤ 1 %); Pallas/Triton flash attention (same sm_103 code-generation gap as XLA's Triton GEMMs). What remains is structural: with `nothing_saveable` remat every forward GEMM runs twice, and the GELU/softmax elementwise passes cannot be fused into GEMM epilogues without the Triton path that this XLA build cannot generate for sm_103. At 512 samples per GPU there is no memory to save GEMM outputs instead of recomputing them (~1.4 GB per sample for the MLP intermediates alone); at 64 per GPU (global 256) a `dots_with_no_batch_dims_saveable` policy would fit and remove the recompute — that is the next lever if throughput per sample matters more than the batch size.
+
+#### A JAX that knows sm_103: second venv, measured
+
+The GR00T baseline gets `torch.compile` on B300 from a second venv with a CUDA 13 PyTorch. The JAX analogue is a second venv with a current JAX: the newest release that still supports this repo's Python 3.11 is **jax 0.10.2** (0.11 needs 3.12), with the `cuda13` plugin (CUDA 13 ptxas/cuBLAS/cuDNN 9.26/NCCL 2.31, matching the host driver). Its XLA knows compute capability 10.3 — no `Unknown compute capability` warnings, Triton GEMM fusions compile — so `xla_gpu_compat.py`'s workaround is no longer needed for correctness (it still applies, since it keys on the GPU, and is harmless: see below). Build it next to the repo, not by editing `uv.lock` (the lerobot fork pins `numpy<2`, jax 0.10 needs `numpy>=2`; torch stays 2.7.1, the PyPI aarch64 build, which the JAX training path only uses on the CPU):
+
+```bash
+V=/tmp/dev/baselines/venv-openpi-jax010            # anywhere outside the repo
+uv venv --python 3.11 $V
+# everything in the working venv except the JAX stack, torch and the nvidia-* wheels, unpinned
+uv pip freeze --python .venv/bin/python | grep -v -iE '^(jax|jaxlib|jax-cuda|flax|orbax|chex|optax|ml-dtypes|ml_dtypes|tensorstore|numpy|scipy|torch|torchvision|torchcodec|triton|nvidia-|openpi|-e |jaxtyping|equinox|augmax|treescope)' \
+    | grep -v '^lerobot' | sed -E 's/==.*//' > /tmp/base_names.txt
+# --no-config: otherwise uv applies this repo's [tool.uv] override-dependencies (ml-dtypes 0.4.1, tensorstore 0.1.74)
+uv pip install --no-config --python $V/bin/python "jax[cuda13]==0.10.2" "flax==0.12.8" "orbax-checkpoint==0.12.4" \
+    "chex==0.1.92" optax "numpy>=2,<3" scipy "jaxtyping==0.2.36" equinox augmax treescope "torch==2.7.1" "torchvision==0.22.1" \
+    "transformers==5.5.4" "av==15.1.0" "opencv-python==4.11.0.86" "opencv-python-headless==4.11.0.86" "draccus==0.10.0" \
+    numpydantic -r /tmp/base_names.txt
+uv pip install --no-config --python $V/bin/python --no-deps \
+    "lerobot @ git+https://github.com/wensi-ai/lerobot@c43f58116b975ae79af62714e1417b38facd4e37"
+uv pip install --no-config --python $V/bin/python --no-deps -e . -e packages/openpi-client
+# run with: JAXTYPING_DISABLE=1 JAX_COMPILATION_CACHE_DIR=/tmp/.cache/jax-010 $V/bin/python scripts/b1k/train_b1k.py ...
+```
+
+Two small compatibility fixes in the repo make openpi run on it and are no-ops on the pinned stack: `training/sharding.py` creates the mesh with `axis_types=Auto` (newer `jax.make_mesh` defaults to Explicit axes, whose sharding rules reject the replicated per-sample RNG keys vmapped next to the sharded images in `preprocess_observation`), and `models/model.py::restore_params` reads orbax ≥ 0.12's `StepMetadata.item_metadata`. `JAXTYPING_DISABLE=1` is required because flax 0.12 keeps `nnx.Variable` objects inside the optimizer state and `TrainState`'s `optax.OptState` annotation no longer type-checks; `jaxtyping` itself has to stay at 0.2.36 (`array_typing.py` patches one of its private functions). `pi0_test.py::test_pi0_gemma_lora` fails on flax 0.12 (`flat_state()` paths changed) — the LoRA variants were not checked further; full fine-tuning, checkpoint save, `--resume` and the loss curve (step 0: 0.8662 vs 0.8656) were.
+
+Result (same code, kmajor attention; pure GPU step time on a fixed batch, 4 GPUs):
+
+| | jax 0.5.3 + cuda12 (pinned) | jax 0.10.2 + cuda13 |
+|---|---|---|
+| batch 512, max_token_len 200 | 2.23 s/step | 2.13 s/step |
+| batch 2048, max_token_len 144 | 8.87 s/step (231 samples/s), peak 222 GiB | **8.10 s/step (253 samples/s)**, peak 240 GiB |
+
+So the newer stack is worth another ~5–9 % (together with the changes above: 10.54 → 8.10 s at batch 2048, +30 % samples/s), but it does not unlock the structural items: XLA's Triton GEMM fusions, now compilable, made the step *slower* (2.19 vs 2.13 s at batch 512 with `XLA_FLAGS=--xla_gpu_enable_triton_gemm=true`, so leaving the workaround's `=false` in place is the right default here too); `--xla_gpu_enable_cublaslt=true` no longer crashes but changes nothing; and cuDNN's fused attention still refuses Gemma's head_dim 256 (`Num hidden_dim should be less than or equal to 128` from the cuDNN graph validation, after the wrapper's new multiple-of-64 sequence-length requirement is met). Compile time grows (632 s vs 455 s for batch 2048) and peak memory too (240 of 249 GiB at 2048 — still fits, with less margin). The pinned environment therefore remains the default; the recipe above is for those who want the last 8 %.
+
 ---
 
 ### Quick reference

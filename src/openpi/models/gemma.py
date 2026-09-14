@@ -213,22 +213,34 @@ class Attention(nn.Module):
             k = jnp.concatenate([cache_k, k], axis=1)
             v = jnp.concatenate([cache_v, v], axis=1)
 
-        q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
-        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
-
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
                 f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
             )
 
+        # KV-head-major layouts for the attention core. With the kv-head axis K placed in front of the query
+        # tokens (B K T G H), the score GEMM folds (T G) into its row dimension and produces the [B K T G S] scores
+        # with S as the minor axis, so the mask, the softmax (a row reduction) and the cast to `dtype` fuse into one
+        # pass and the probabilities feed the second GEMM as-is. The original `B T K G H` formulation made XLA emit
+        # the fp32 scores with G minor and transpose the full [B, G, T, S] score/probability tensors (4 GB per
+        # layer at 128 samples) several times per layer; this halves the attention core's forward+backward time
+        # at training shapes. The math is unchanged (same GEMMs and softmax, only the operand layouts differ), and
+        # the results are as close to an fp32 reference as before -- but not bit-identical, since cuBLAS picks
+        # different kernels for the new layouts. The rearranges below touch only q/k/v/output (bf16, B*T*N*H).
+        num_kv_heads = self.configs[0].num_kv_heads
+        q_heads = einops.rearrange(q, "B T (K G) H -> B K T G H", K=num_kv_heads)
+        k_heads = einops.rearrange(k, "B S K H -> B K S H")
+        v_heads = einops.rearrange(v, "B S K H -> B K S H")
+        logits = jnp.einsum("BKTGH,BKSH->BKTGS", q_heads, k_heads, preferred_element_type=jnp.float32)
+
         # big_neg = jnp.finfo(logits.dtype).min
         big_neg = -2.3819763e38  # See gemma/modules.py
-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+        masked_logits = jnp.where(attn_mask[:, :, :, None, :], logits, big_neg)  # mask [B 1 T S] over K and G
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
 
-        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
-        encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+        encoded = jnp.einsum("BKTGS,BKSH->BKTGH", probs, v_heads)
+        encoded = einops.rearrange(encoded, "B K T G H -> B T (K G) H")
 
         out = []
         start = 0
