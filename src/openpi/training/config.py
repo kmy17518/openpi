@@ -517,14 +517,31 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         # You do not need to change anything here for your own dataset.
         model_transforms = ModelTransformFactory()(model_config)
 
+        base_config = self.create_base_config(assets_dirs, model_config)
+        # Data-loader CPU cost per sample, for the B1K dataset class (either default can be overridden by putting the
+        # key into `dataset_kwargs` explicitly):
+        # - decode only the camera streams the robot config consumes (the repack transform drops everything else);
+        #   the challenge demos also carry depth streams, which would double the decoding work. `video_keys=None`
+        #   decodes every stream.
+        # - hand frames over as uint8 instead of lerobot's float32-in-[0,1]: B1KInputs converts them straight back to
+        #   uint8, and the round trip both costs time and truncates some pixel values by one.
+        dataset_kwargs = base_config.dataset_kwargs
+        if isinstance(base_config.data_cls, type) and issubclass(base_config.data_cls, _b1k_dataset.B1KLeRobotDataset):
+            dataset_kwargs = {
+                "video_keys": [obs.dataset_key for obs in robot_config.observations.values()],
+                "return_uint8": True,
+                **dataset_kwargs,
+            }
+
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=(robot_config.action_key,),
             use_quantile_norm=False,
+            dataset_kwargs=dataset_kwargs,
         )
 
 
