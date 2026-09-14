@@ -18,6 +18,7 @@ import wandb
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+import openpi.shared.xla_gpu_compat as _xla_gpu_compat
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -423,6 +424,10 @@ def train_step(
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+
+    # Must precede the first JAX device query below: works around XLA aborting on GPUs newer than the pinned jax
+    # (B300, compute capability 10.3) -- see openpi/shared/xla_gpu_compat.py.
+    _xla_gpu_compat.configure_xla_flags()
 
     if config.batch_size % (jax.device_count() * config.grad_accum_steps) != 0:
         raise ValueError(
