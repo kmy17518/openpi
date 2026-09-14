@@ -2,7 +2,7 @@
 
 This tutorial walks through fine-tuning [π₀.₅](https://www.physicalintelligence.company/blog/pi05) on demonstration data from [BEHAVIOR-1K](https://github.com/StanfordVL/BEHAVIOR-1K) using this repository.
 
-**Last updated:** June 2026  
+**Last updated:** September 2026  
 **OpenPi model:** π₀.₅ (`pi05`)  
 **Robot:** R1Pro (dual-arm mobile manipulator)
 
@@ -35,6 +35,8 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
 `GIT_LFS_SKIP_SMUDGE=1` is required because LeRobot is pulled in as a dependency.
+
+On ARM Linux hosts (aarch64, e.g. NVIDIA Grace) and on B300 GPUs the pinned toolchain needs the adjustments described in [Blackwell Ultra (B300) and ARM hosts](#blackwell-ultra-b300-and-arm-aarch64-hosts); they are part of this checkout and no-ops elsewhere.
 
 ---
 
@@ -232,7 +234,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/b1k/train_b1k.py <CONFIG_NAME>
     --data.task-names <TASK_NAME>
 ```
 
-`--data.task-names <TASK_NAME>` restricts training to that task whether `<DATASET_ROOT>` is a per-task partial download or the full 100-task root (see [above](#which-demos-are-on-disk-one-task-or-all-100)); drop it to train on every task under the root. Use the same `--data.*` flags as for `compute_norm_stats.py` so training finds the matching statistics.
+`--data.task-names <TASK_NAME>` restricts training to that task whether `<DATASET_ROOT>` is a per-task partial download or the full 100-task root (see [above](#which-demos-are-on-disk-one-task-or-all-100)); drop it to train on every task under the root. Use the same `--data.*` flags as for `compute_norm_stats.py` so training finds the matching statistics. The challenge docs spell the dataset flag `--data.base_config.dataset_root=<DATASET_ROOT>`; both scripts accept that as an alias of `--data.dataset-root`.
 
 Checkpoints are saved under:
 
@@ -245,6 +247,11 @@ outputs/checkpoints/<CONFIG_NAME>/<EXP_NAME>/<STEP>/
 | Flag | Purpose |
 |------|---------|
 | `--batch_size` | Per-step batch size (must divide evenly across GPUs) |
+| `--num_workers` | Data-loader worker processes (default 8; see [Batch size and data-loader settings](#batch-size-and-data-loader-settings-for-4-gpus)) |
+| `--grad_accum_steps` | Micro-batches per optimizer step (gradient accumulation; same update as the full batch). `--batch_size` must be divisible by it times the GPU count. See [Gradient accumulation, remat policy and FSDP](#gradient-accumulation-a-lighter-remat-policy-and-fsdp-measured) |
+| `--prefetch_batches` | Batches fetched ahead by a background thread while the step runs (default 2; 0 disables) |
+| `--model.remat-policy` | Gradient-checkpointing policy of the transformer blocks (`nothing_saveable` default, `dots_with_no_batch_dims_saveable`, ...; training only, does not change the math) |
+| `--fsdp_devices` | Shard parameters and optimizer state over this many GPUs (default 1 = replicated) |
 | `--num_train_steps` | Total optimization steps |
 | `--data.repo_id` | Override dataset repo ID (asset id of the norm stats) |
 | `--data.dataset-root` | Override local dataset path |
@@ -326,6 +333,155 @@ Point your BEHAVIOR-1K robot client at the server host and port to stream observ
 
 ---
 
+### Blackwell Ultra (B300) and ARM (aarch64) hosts
+
+The pinned toolchain — `jax[cuda12]==0.5.3`, `torch==2.7.1+cu128`, `torchcodec 0.11` — predates NVIDIA's Blackwell Ultra GPUs (B300, CUDA compute capability 10.3) and has gaps on ARM Linux (aarch64, e.g. NVIDIA Grace CPUs). Run unchanged on such a host, the π₀.₅ walkthrough of the challenge docs fails at every stage: `uv sync` (no aarch64 wheel for triton), training and serving (XLA aborts while compiling the first matrix multiply), and data loading (video decoding so slow that the GPU idles). The changes below, all in this checkout, make the stock `compute_norm_stats.py` → `train_b1k.py` / `train_b1k.sh` → `serve_b1k.py` commands work as documented. On x86-64 hosts with GPUs that jax 0.5.3 already knows (A100, H100, H200, B200) they change nothing except the two path fixes (`train_b1k.sh` venv, JAX cache directory) and the accepted flag spelling.
+
+| Symptom on a B300 / aarch64 host | Cause | Change |
+|-----------------------------------|-------|--------|
+| `uv sync`: `Distribution triton==3.3.1 @ registry+https://pypi.org/simple can't be installed because it doesn't have a source distribution or wheel for the current platform` | PyPI ships only x86-64 wheels for the triton that `torch==2.7.1` requires; PyTorch's own index has aarch64 wheels | `pyproject.toml` declares PyTorch's cu128 index (`[[tool.uv.index]] pytorch-cu128`, `explicit = true`) and pins `torch` (Linux) and `triton` (Linux/aarch64) to it. `triton` is listed as a direct dependency behind the same marker because uv ignores index pins for purely transitive packages. `uv.lock` was re-locked (`GIT_LFS_SKIP_SMUDGE=1 uv lock`). |
+| Training or serving dies with exit code 134 at the first jitted matmul. Log: `Unknown compute capability 10.3. Defaulting to telling LLVM that we're compiling for sm_101`, then `F ... gemm_fusion_autotuner.cc ... ptxas exited with non-zero error code ... Instruction 'tcgen05.alloc' not supported on .target 'sm_101'` | XLA in jax 0.5.3 does not know compute capability 10.3 and falls back to the `sm_101` target, but its Triton GEMM emitter still generates Blackwell `tcgen05` instructions for it, so ptxas rejects every autotuner candidate | New `src/openpi/shared/xla_gpu_compat.py`. `configure_xla_flags()` reads the compute capability of every visible GPU through the CUDA driver API (no CUDA context, honours `CUDA_VISIBLE_DEVICES`) and, for 10.3, appends `--xla_gpu_enable_triton_gemm=false` to `XLA_FLAGS` so matrix multiplies run through cuBLAS; everything else XLA generates compiles fine for the fallback target. `train_b1k.py` and `serve_b1k.py` call it before their first JAX device query. An explicit `--xla_gpu_enable_triton_gemm=...` already present in `XLA_FLAGS` is left alone (that is the override, e.g. after upgrading jax). |
+| The first batch takes ~4.5 min, then 20–40 s/step with the GPU at 0 %. Log: `torchcodec is installed but cannot be loaded ...; decoding videos with pyav` | torchcodec's wheel does not load against this torch on aarch64, so `B1KLeRobotDataset` decodes with PyAV (this fallback already existed). `torchvision.io` — imported by lerobot — calls `av.logging.set_level(av.logging.ERROR)` at import time, which installs PyAV's Python log callback. That callback takes the GIL for *every* FFmpeg log line, and libavformat emits tens of thousands of TRACE-level lines while parsing one mp4 header; with lerobot decoding the six camera streams of a sample in six threads (and 8 data-loader workers) the GIL round-trips make each `av.open` take 1–4 s (measured: 6 concurrent opens 6 ms → 2.3 s once torchvision is imported; 3.8 s per sample, 0.03 s of which is decoding) | `B1KLeRobotDataset`'s reader restores PyAV's default no-op log callback (`av.logging.set_level(None)`, `quiet_pyav_logging()` in `b1k_dataset.py`) before decoding with the `pyav` backend — once per process, so data-loader workers (which re-import torchvision) are covered too. Only PyAV's error-message bookkeeping is lost. Result on this host: 0.03 s per sample, first batch in ~45 s. |
+| `./scripts/b1k/train_b1k.sh ...`: `source: /home/ubuntu/jiajun-stanford-lab/Research/openpi/.venv/bin/activate: No such file or directory` | hard-coded developer path | The script activates `<OPENPI_DIR>/.venv` relative to its own location when that exists; `uv run` uses it either way. |
+| `train_b1k.py` writes the JAX compilation cache to `~/.cache/jax` regardless of `JAX_COMPILATION_CACHE_DIR` | hard-coded path | Honours `JAX_COMPILATION_CACHE_DIR` when set, like `scripts/train.py` already did. |
+| `Unrecognized options: --data.base-config.dataset-root=...` for the commands copied from the challenge docs | `base_config` is not exposed on the CLI (it holds transforms and norm stats) | `--data.base_config.dataset_root` is an alias of `--data.dataset-root` on `LeRobotB1KDataConfig` (`compute_norm_stats.py` and `train_b1k.py`). |
+
+Not GPU-specific, but needed on a host whose `WANDB_BASE_URL` points at a server the `WANDB_API_KEY` is not valid for: `wandb.init` fails with `CommError: returned error 401`; run with `WANDB_MODE=offline` (sync later with `wandb sync`) or pass `--no-wandb-enabled`.
+
+Verified on a 4× B300 aarch64 host with the single-task `chop_an_onion` download (`--data.repo_id=behavior-1k/2026-challenge-demos --data.base_config.dataset_root=<DATASET_ROOT>`), everything else as in the challenge docs:
+
+| Command | Result |
+|---------|--------|
+| `uv run scripts/compute_norm_stats.py pi05_b1k ...` | 1,279,960 frames (200 episodes) in ~35 s |
+| `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/b1k/train_b1k.py pi05_b1k --exp_name=... --overwrite --batch_size=64 ...` (1 GPU) | data loader ready in ~45 s, 1.2 s/step at batch 64; checkpoint + resume (`--resume`) work |
+| `./scripts/b1k/train_b1k.sh pi05_b1k 4 0,1,2,3 ...` | 4 GPUs at 100 %, 0.42 s/step (2.4 it/s) at global batch 64 |
+| `CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 uv run scripts/b1k/serve_b1k.py --robot b1k/R1Pro --task b1k/<TASK_NAME> --repo-id <REPO_ID> --policy.config pi05_b1k --policy.dir <CHECKPOINT_DIR> --control_mode receding_horizon --action_horizon 16 --port 8000` | serves; first request ~5 s (JIT), then ~30 ms per step averaged over the receding horizon |
+
+Known limits: `scripts/train.py` and `scripts/serve_policy.py` (the non-B1K entry points) do not call `configure_xla_flags()` — export `XLA_FLAGS=--xla_gpu_enable_triton_gemm=false` yourself or add the call. `torch.compile` and the PyTorch training path (`scripts/train_pytorch.py`) were not exercised; the bundled triton 3.3.1 does not target compute capability 10.3 either. The `Unknown compute capability 10.3` warning itself keeps being printed by XLA once per compiled kernel and is harmless.
+
+#### Batch size and data-loader settings for 4 GPUs
+
+Measured on the same 4× B300 node with data-parallel training (`fsdp_devices=1`, one model replica per GPU, `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` = 249 GiB usable per GPU). The train step was timed on a fixed batch, so these are pure GPU numbers:
+
+| Global batch (per GPU) | s/step | samples/s | peak GPU memory | compile + first step |
+|-----------------------:|-------:|----------:|----------------:|---------------------:|
+| 64 (16) — the documented default | 0.42 | 154 | 67 GiB | 8 s (cached) |
+| 128 (32) | 0.70 | 183 | 71 GiB | 43 s |
+| 256 (64) | 1.32 | 194 | 82 GiB | 93 s |
+| 512 (128) | 2.56 | 200 | 105 GiB | 126 s |
+| 1024 (256) | 5.11 | 200 | 151 GiB | 179 s |
+| 2048 (512) | 10.5 | 194 | 235 GiB | 521 s |
+| 2560 (640) | — | — | out of memory | — |
+
+Params + optimizer state take 51 GiB per GPU; activations add ~0.36 GiB per sample. The largest batch that fits is **2048** (512 per GPU), but throughput saturates at ~200 samples/s from **512** on — every larger batch only buys longer compiles, more memory and fewer optimizer steps per sample. Going from the default 64 to 512 gives +30 % samples/s; the LR schedule (`CosineDecaySchedule`, tuned for batch 64) and `num_train_steps` are not adjusted automatically, so scale them when you change the batch.
+
+The data loader has to deliver those ~200 samples/s. Three changes to the B1K pipeline cut its CPU cost per sample roughly in half (all default now, each overridable through `dataset_kwargs`): only the three RGB camera streams of the robot config are decoded (`video_keys`; the depth streams were decoded and thrown away), frames are handed over as uint8 instead of lerobot's float32 (`return_uint8=True`; the float round trip also truncated some pixel values by one), and images are made contiguous before the PIL resize in `B1KInputs`. Loader throughput on this node (standalone, batch 256):
+
+| `--num_workers` | before | after | worker start-up |
+|-----------------|-------:|------:|----------------:|
+| 8 (default) | 151 samples/s | 252 samples/s | ~45 s |
+| 16 | 280 | 478 | ~80 s |
+| 32 | 368 | 790 | 3–5 min |
+
+`OMP_NUM_THREADS` (1, 8 or unset) made no measurable difference to either number: the workers run torch with one thread anyway and the decoding threads are FFmpeg's own. Setting it to 1 merely trims ~125 idle OpenMP threads per worker process.
+
+Recommended 4-GPU command (verified: 2.5–2.7 s/step, i.e. the GPU-bound rate, with both 8 and 16 workers; 16 leaves ~2× headroom):
+
+```bash
+./scripts/b1k/train_b1k.sh pi05_b1k 4 0,1,2,3 \
+    --batch_size=512 --num_workers=16 \
+    --data.repo_id=<REPO_ID> --data.dataset-root=<DATASET_ROOT>
+```
+
+(`train_b1k.sh` passes its own `--batch_size=64` first; the later `--batch_size=512` wins.)
+
+#### Where a large-batch step spends its time, and what was done about it
+
+Profiled with Nsight Systems (the JAX profiler's CUPTI does not support this GPU: `CUPTI_ERROR_INVALID_DEVICE`) on 4× B300 at global batch 2048 (512 per GPU) and 512; the two profiles have the same shape. The step is entirely GPU-bound — kernels cover 10.71 s of a 10.7 s step, no gaps, and the data loader is idle — so batch 2048 is limited by the compiled train step itself, not by input. Per GPU and step, before the changes below:
+
+| Kernel class | Share | Notes |
+|--------------|------:|-------|
+| cuBLAS GEMMs (`cutlass3x_sm100_*`, Blackwell kernels) | 53 % | projections, MLP, attention score/value products; ~1.7 PFLOP/s while running, i.e. close to the part's dense-bf16 peak |
+| XLA fusions (elementwise, transposes, reductions) | 42 % | **29 % of the whole step was five per-layer kernels in the Gemma attention core** (`loop_transpose_fusion`, `input_select_transpose_fusion`, …): XLA laid the fp32 attention scores out as `[B, T, S, G]` with the 8 query heads as the minor axis, so the softmax was a strided reduction and the score/probability tensors — 4 GB per layer at 128 samples — were transposed several times per layer in forward, recompute and backward |
+| NCCL all-reduce | 3–4 % | ~290 small ring all-reduces per step; already overlapped |
+| cuDNN convolution | 2 % | SigLIP patch embedding |
+
+`preferred_element_type=float32` for the scores, full gradient checkpointing (`nn.remat(..., policy=nothing_saveable)`, i.e. every layer's forward is recomputed in the backward pass) and fp32 master weights are all as in upstream openpi and unchanged.
+
+Changes, each measured on a fixed real batch (pure GPU step time, 4 GPUs):
+
+- **KV-head-major attention layouts** (`src/openpi/models/gemma.py`, `Attention.__call__`). The core is now written as `q: B K T G H`, `k, v: B K S H`, `logits = einsum("BKTGH,BKSH->BKTGS")`, mask broadcast `[B 1 T 1 S]`, `einsum("BKTGS,BKSH->BKTGH")`, i.e. the same GEMMs and softmax with the kv-head axis in front. XLA then emits the scores with S minor, the mask + softmax + cast become one fused kernel, and no score-sized tensor is transposed. The attention core's forward+backward at 128 samples × 1001 tokens goes 30 ms → 15 ms per layer. Not bit-identical (cuBLAS chooses different kernels for the new layouts) but exactly as accurate: against an fp32 reference both formulations show max error 0.015 / mean 0.001 on the output and identical error statistics on dq/dk/dv; a 30-step training run reproduces the earlier loss curve to three decimals (0.8661 / 0.9681 / 0.8113 / 0.8737 vs 0.8656 / 0.9681 / 0.8111 / 0.8735). Serving uses the same module. Effect on the whole step: batch 2048 10.54 → 9.35 s (194 → 219 samples/s), batch 512 2.56 → 2.23 s (200 → 229 samples/s); peak memory unchanged (232 vs 235 GiB at 2048).
+- **`--model.max-token-len 144`** (per run; default stays 200). The prompt + discretized-state tokens of the challenge demos use 83–101 of the 200 token slots (the fail-fast check in `create_b1k_dataset` bounds the worst case for `task_name` prompts at 142), and the remaining padding is masked but still multiplied through every layer. 144 shortens the sequence from 1001 to 945 tokens: batch 512 2.23 → 2.14 s/step (240 samples/s), identical loss. It is a pure efficiency knob — padding tokens are masked out and positions are cumulative over valid tokens, so the checkpoint can be served with the default 200. For `task_description` prompts keep the value the check asks for.
+
+Tried and rejected: `jax.nn.dot_product_attention(implementation="cudnn")` (jax 0.5.3's wrapper requires head_dim ≤ 128, Gemma has 256); `--xla_gpu_enable_cublaslt=true` (GELU epilogue fusion — crashes with a bus error on this platform); `--xla_gpu_enable_latency_hiding_scheduler`, `--xla_gpu_all_reduce_combine_threshold_bytes` (≤ 1 %); Pallas/Triton flash attention (same sm_103 code-generation gap as XLA's Triton GEMMs). What remains is structural: with `nothing_saveable` remat every forward GEMM runs twice, and the GELU/softmax elementwise passes cannot be fused into GEMM epilogues without the Triton path that this XLA build cannot generate for sm_103. At 512 samples per GPU there is no memory to save GEMM outputs instead of recomputing them (~1.4 GB per sample for the MLP intermediates alone); at 64 per GPU (global 256) a `dots_with_no_batch_dims_saveable` policy would fit and remove the recompute — done, together with gradient accumulation so that the global batch can stay at 2048, in [Gradient accumulation, a lighter remat policy and FSDP](#gradient-accumulation-a-lighter-remat-policy-and-fsdp-measured) below.
+
+#### A JAX that knows sm_103: second venv, measured
+
+The GR00T baseline gets `torch.compile` on B300 from a second venv with a CUDA 13 PyTorch. The JAX analogue is a second venv with a current JAX: the newest release that still supports this repo's Python 3.11 is **jax 0.10.2** (0.11 needs 3.12), with the `cuda13` plugin (CUDA 13 ptxas/cuBLAS/cuDNN 9.26/NCCL 2.31, matching the host driver). Its XLA knows compute capability 10.3 — no `Unknown compute capability` warnings, Triton GEMM fusions compile — so `xla_gpu_compat.py`'s workaround is no longer needed for correctness (it still applies, since it keys on the GPU, and is harmless: see below). Build it next to the repo, not by editing `uv.lock` (the lerobot fork pins `numpy<2`, jax 0.10 needs `numpy>=2`; torch stays 2.7.1, the PyPI aarch64 build, which the JAX training path only uses on the CPU):
+
+```bash
+V=/tmp/dev/baselines/venv-openpi-jax010            # anywhere outside the repo
+uv venv --python 3.11 $V
+# everything in the working venv except the JAX stack, torch and the nvidia-* wheels, unpinned
+uv pip freeze --python .venv/bin/python | grep -v -iE '^(jax|jaxlib|jax-cuda|flax|orbax|chex|optax|ml-dtypes|ml_dtypes|tensorstore|numpy|scipy|torch|torchvision|torchcodec|triton|nvidia-|openpi|-e |jaxtyping|equinox|augmax|treescope)' \
+    | grep -v '^lerobot' | sed -E 's/==.*//' > /tmp/base_names.txt
+# --no-config: otherwise uv applies this repo's [tool.uv] override-dependencies (ml-dtypes 0.4.1, tensorstore 0.1.74)
+uv pip install --no-config --python $V/bin/python "jax[cuda13]==0.10.2" "flax==0.12.8" "orbax-checkpoint==0.12.4" \
+    "chex==0.1.92" optax "numpy>=2,<3" scipy "jaxtyping==0.2.36" equinox augmax treescope "torch==2.7.1" "torchvision==0.22.1" \
+    "transformers==5.5.4" "av==15.1.0" "opencv-python==4.11.0.86" "opencv-python-headless==4.11.0.86" "draccus==0.10.0" \
+    numpydantic -r /tmp/base_names.txt
+uv pip install --no-config --python $V/bin/python --no-deps \
+    "lerobot @ git+https://github.com/wensi-ai/lerobot@c43f58116b975ae79af62714e1417b38facd4e37"
+uv pip install --no-config --python $V/bin/python --no-deps -e . -e packages/openpi-client
+# run with: JAXTYPING_DISABLE=1 JAX_COMPILATION_CACHE_DIR=/tmp/.cache/jax-010 $V/bin/python scripts/b1k/train_b1k.py ...
+```
+
+Two small compatibility fixes in the repo make openpi run on it and are no-ops on the pinned stack: `training/sharding.py` creates the mesh with `axis_types=Auto` (newer `jax.make_mesh` defaults to Explicit axes, whose sharding rules reject the replicated per-sample RNG keys vmapped next to the sharded images in `preprocess_observation`), and `models/model.py::restore_params` reads orbax ≥ 0.12's `StepMetadata.item_metadata`. `JAXTYPING_DISABLE=1` is required because flax 0.12 keeps `nnx.Variable` objects inside the optimizer state and `TrainState`'s `optax.OptState` annotation no longer type-checks; `jaxtyping` itself has to stay at 0.2.36 (`array_typing.py` patches one of its private functions). `pi0_test.py::test_pi0_gemma_lora` fails on flax 0.12 (`flat_state()` paths changed) — the LoRA variants were not checked further; full fine-tuning, checkpoint save, `--resume` and the loss curve (step 0: 0.8662 vs 0.8656) were.
+
+Result (same code, kmajor attention; pure GPU step time on a fixed batch, 4 GPUs):
+
+| | jax 0.5.3 + cuda12 (pinned) | jax 0.10.2 + cuda13 |
+|---|---|---|
+| batch 512, max_token_len 200 | 2.23 s/step | 2.13 s/step |
+| batch 2048, max_token_len 144 | 8.87 s/step (231 samples/s), peak 222 GiB | **8.10 s/step (253 samples/s)**, peak 240 GiB |
+
+So the newer stack is worth another ~5–9 % (together with the changes above: 10.54 → 8.10 s at batch 2048, +30 % samples/s), but it does not unlock the structural items: XLA's Triton GEMM fusions, now compilable, made the step *slower* (2.19 vs 2.13 s at batch 512 with `XLA_FLAGS=--xla_gpu_enable_triton_gemm=true`, so leaving the workaround's `=false` in place is the right default here too); `--xla_gpu_enable_cublaslt=true` no longer crashes but changes nothing; and cuDNN's fused attention still refuses Gemma's head_dim 256 (`Num hidden_dim should be less than or equal to 128` from the cuDNN graph validation, after the wrapper's new multiple-of-64 sequence-length requirement is met). Compile time grows (632 s vs 455 s for batch 2048) and peak memory too (240 of 249 GiB at 2048 — still fits, with less margin). The pinned environment therefore remains the default; the recipe above is for those who want the last 8 %.
+
+#### Gradient accumulation, a lighter remat policy and FSDP (measured)
+
+Three knobs that leave the optimizer update unchanged (the same gradient up to floating-point summation order, the same number of samples per step), measured like everything above — pure GPU step time on a fixed real batch, 4× B300, jax 0.10.2, `--model.max-token-len 144`:
+
+- **`--model.remat-policy`** (new `Pi0Config.remat_policy`, applied to both the Gemma blocks and SigLIP; the default `nothing_saveable` is exactly the previous hard-coded behaviour). `dots_with_no_batch_dims_saveable` keeps the outputs of the projection and MLP matmuls from the forward pass instead of recomputing them in the backward pass; the attention score/value einsums have batch dimensions and are still recomputed. It costs ~1.2 GiB per sample, so it needs 64 samples per GPU or fewer (128 per GPU: out of memory even with FSDP). At 64 per GPU a plain step goes 1.061 → 0.984 s (−7 %), with the same loss on the same batch (1.1138 vs 1.1137; a 31-step run at batch 256 tracks the `nothing_saveable` curve to three decimals, 1.0932 / 0.9399 / 0.8661 / 0.7755 vs 1.0933 / 0.9396 / 0.8657 / 0.7753 — the same kernel-selection noise as the attention-layout change above). Going further does not pay: `dots_saveable` (also keep the fp32 attention scores) is *slower* (7.99 vs 7.73 s at batch 2048 — writing and re-reading the scores costs more than recomputing them) and `none` (no rematerialization) needs > 500 GiB.
+- **`--grad_accum_steps k`** (`train_b1k.py`). The data loader lays every batch out as `[k, B/k, ...]` (`TorchDataLoader(micro_batches=k)`, sharding from `data_loader.micro_batch_sharding`: micro-batch axis replicated, sample axis data-parallel) and `train_step` runs a `lax.scan` over the micro-batches, summing their mean-loss gradients and dividing by `k` — with equal-sized micro-batches that is the gradient of the mean loss over the whole batch. Each micro-batch draws its own noise / timestep / augmentation randomness, as the samples of one full batch do. Checked against an independently computed per-micro-batch reference (loss to 2e-5, gradient norm to 6e-5 relative; both venvs, with and without FSDP). The loop itself is free: 7.891 s / 8 = 0.986 s per 64-sample micro-batch against 0.984 s for a standalone 64-per-GPU step, i.e. the per-micro-batch gradient reduction does not show up. Its point is that only one micro-batch's activations are live at a time, which is what lets the remat policy above run at global batch 2048.
+- **`--fsdp_devices 4`** shards parameters, Adam moments and EMA weights over the four GPUs (50 → 12.5 GiB resident per GPU); the per-layer all-gathers hide behind compute. Alone it is worth ~1 % (8.10 → 8.00 s at 2048) and 43 GiB of peak memory.
+
+| | batch 512 | batch 2048 | peak GPU memory (2048) | compile + first step (2048) |
+|---|---:|---:|---:|---:|
+| as above (`nothing_saveable`, no accumulation, no FSDP) | 2.040 s (251 samples/s) | 8.102 s (253) | 240 GiB | 632 s |
+| `--model.remat-policy dots_with_no_batch_dims_saveable`, 64/GPU micro-batches (`--grad_accum_steps` 2 / 8) | 1.988 s (258) | 7.891 s (260) | 189 GiB | 117 s |
+| … + `--fsdp_devices 4` (**recommended**) | **1.929 s (266)** | **7.725 s (265)** | **137 GiB** | 112 s |
+| `--fsdp_devices 4` alone | 2.024 s (253) | 8.002 s (256) | 197 GiB | 768 s |
+
+So −5 % step time at both batch sizes, −100 GiB of peak memory and a 6× shorter compile at 2048 (the scan body is compiled once at micro-batch shapes). The gain is modest because the recompute that `nothing_saveable` forces is ~19 % of the matmul FLOPs but matmuls are ~55 % of the step, the attention core is still recomputed, and 64 samples per GPU run ~5 % less efficiently per sample than 512. Tried and rejected on top of this: XLA's cross-iteration collective pipelining (`--xla_gpu_enable_pipelined_all_reduce/reduce_scatter/all_gather` + latency-hiding scheduler: out of memory at 2048 — its memory plan does not fit); a policy saving only the MLP outputs to reach 128 samples per GPU was not tried (the full `dots_with_no_batch_dims_saveable` at 128 asks for 231 GiB).
+
+**The batch hand-off was not overlapped with the step** (`--prefetch_batches`, default 2). Timing the real loop at batch 2048 showed the call that dispatches the jitted step blocking for 7.65 s of a 7.7 s step: on this XLA:GPU build the host thread stays inside the executable while its kernels are enqueued, so after one or two steps of run-ahead the loop is synchronous, and `next(data_iter)` — receiving the collated 1 GB batch from the worker process, slicing it per device and copying it over — adds directly: 0.05 s on a good step, 0.5–1 s often, 4.4 s once when a worker was late, 0.47 s on average, i.e. 8.14 s/step end to end for a 7.73 s step. (At batch 256 the hand-off is 0.01 s and the loop matches the compiled step, which is why the earlier end-to-end checks at small batches did not show it; the loader itself keeps up easily — 16 workers deliver 2048-sample batches at 484 samples/s.) `train_b1k.py` now pulls the batches in a background thread (`data_loader.PrefetchIterator`, up to `--prefetch_batches` ready on the devices): the hand-off drops to 0.03 s and the loop runs at **7.84 s/step end to end** at 2048 (1.97 s at 512) with the recipe above, within 2 % of the compiled step. Measured the same way, the original configuration (`nothing_saveable`, no accumulation, no FSDP, no prefetch) runs at 8.25 s/step end to end at 2048 (8.2 s dispatch + 0.5 s hand-off on average, including two late-worker stalls of 2.9 and 4.2 s in 16 steps), so end to end the recipe is 8.25 → 7.84 s/step (−5 %) at 2048, and its step time is no longer at the mercy of a slow worker.
+
+Recommended 4-GPU command for global batch 2048 (`--grad_accum_steps` = batch size / 256, i.e. 64 samples per GPU per micro-batch; batch 512 → 2). The flags work in the pinned `.venv` too, without the two environment variables:
+
+```bash
+V=/tmp/dev/baselines/venv-openpi-jax010
+JAXTYPING_DISABLE=1 JAX_COMPILATION_CACHE_DIR=/tmp/.cache/jax-010 \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+$V/bin/python scripts/b1k/train_b1k.py pi05_b1k --exp_name=<EXP_NAME> --overwrite \
+    --batch_size=2048 --grad_accum_steps=8 --fsdp_devices=4 \
+    --model.remat-policy dots_with_no_batch_dims_saveable --model.max-token-len 144 \
+    --num_workers=16 --data.repo_id=<REPO_ID> --data.dataset-root=<DATASET_ROOT>
+```
+
+None of these knobs touches what is stored: the remat policy, the accumulation and the prefetch are training-time only, and FSDP only changes the in-memory layout (orbax saves and restores global arrays — verified by saving at batch 2048 with the recipe and resuming from it), so the checkpoints are interchangeable with those of the plain configuration and serve unchanged. `scripts/train.py` (the non-B1K entry point) rejects `--grad_accum_steps > 1` and has no prefetch thread; the remat policy and FSDP flags apply there as well.
+
+---
+
 ### Quick reference
 
 | Item | Value |
@@ -353,5 +509,9 @@ Point your BEHAVIOR-1K robot client at the server host and port to stream observ
 | Task prompt not found at serve time | Add `<TASK_NAME>` to `src/openpi/configs/tasks/b1k.py` under the `b1k` bucket, or serve with `--prompt-source task_name` / `--text-prompt` |
 | `task prompt(s) exceed max_token_len` | The instruction plus the discretized state does not fit; pass the suggested `--model.max-token-len`, or train with `--data.prompt-source task_name` |
 | Out of GPU memory | Reduce `--batch_size` or set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` |
+| Exit code 134 with `Unknown compute capability 10.3` and `ptxas ... 'tcgen05.alloc' not supported on .target 'sm_101'` | B300 GPU with the pinned jax; `train_b1k.py` / `serve_b1k.py` handle it, other entry points need `XLA_FLAGS=--xla_gpu_enable_triton_gemm=false` (see [B300 and ARM hosts](#blackwell-ultra-b300-and-arm-aarch64-hosts)) |
+| Minutes per batch, GPU idle, `decoding videos with pyav` in the log | PyAV log-callback contention (fixed in `B1KLeRobotDataset`); if it persists, check that `av.logging.get_level()` is `None` in the worker processes |
+| `Unrecognized options: --data.base-config.dataset-root` | Older checkout; use `--data.dataset-root` (both spellings work here) |
+| `wandb.init` fails with `CommError: returned error 401` | `WANDB_API_KEY` does not match `WANDB_BASE_URL`; use `WANDB_MODE=offline` or `--no-wandb-enabled` |
 
 For general fine-tuning concepts (LeRobot conversion, config structure, remote inference), see the [main README](../README.md) and [remote inference docs](./remote_inference.md).
