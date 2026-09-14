@@ -199,6 +199,8 @@ def main(config: _config.TrainConfig):
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
+    if config.grad_accum_steps != 1:
+        raise NotImplementedError("grad_accum_steps > 1 is only implemented in scripts/b1k/train_b1k.py.")
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path(jax.config.jax_compilation_cache_dir or "~/.cache/jax").expanduser()))  # honors JAX_COMPILATION_CACHE_DIR
 

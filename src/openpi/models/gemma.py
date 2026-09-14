@@ -346,6 +346,8 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # Gradient-checkpointing policy for the blocks: a `jax.checkpoint_policies` name, or "none" to not rematerialize.
+    remat_policy: str = "nothing_saveable"
 
     def setup(self):
         # all experts must have the same depth
@@ -356,12 +358,15 @@ class Module(nn.Module):
             embed_dim=self.configs[0].width,  # embedder for first expert only
             name="embedder",
         )
-        block_cls = nn.remat(
-            Block,
-            prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
-            policy=jax.checkpoint_policies.nothing_saveable,
-        )
+        if self.remat_policy == "none":
+            block_cls = Block
+        else:
+            block_cls = nn.remat(
+                Block,
+                prevent_cse=False,
+                static_argnums=(5,),  # 0=self, 6=deterministic
+                policy=getattr(jax.checkpoint_policies, self.remat_policy),
+            )
         self.layers = nn.scan(
             block_cls,
             variable_axes={"params": 0},
