@@ -242,6 +242,40 @@ def task_prompts(
     return {task_index: descriptions[task_index] for task_index in names if task_index in descriptions}
 
 
+def check_prompt_token_lengths(prompts: dict[int, str], model_config: Any) -> None:
+    """Fail fast if a prompt cannot fit ``model_config.max_token_len`` (PaliGemma-tokenized pi0 / pi05 models).
+
+    ``PaligemmaTokenizer`` truncates over-long prompts from the end -- for pi05, whose prompt is
+    ``Task: <text>, State: <discretized state>;\\nAction:``, that drops state digits and the ``Action:`` marker, so
+    the policy would silently lose its proprioception on those tasks. The challenge demos' task descriptions run
+    up to ~105 tokens, which next to a 32-dim state does not always fit the default ``max_token_len=200``. The
+    state is assumed worst case (every dimension a 3-digit bin).
+    """
+    model_type = getattr(model_config, "model_type", None)
+    if model_type is None or model_type.value not in ("pi0", "pi05"):
+        return
+    from openpi.models import tokenizer as _tokenizer  # local import: fetches the tokenizer model on first use
+
+    max_len = int(model_config.max_token_len)
+    tokenizer = _tokenizer.PaligemmaTokenizer(max_len=max(8 * max_len, 4096))  # long enough to never truncate
+    state = np.full(int(model_config.action_dim), 1.0) if getattr(model_config, "discrete_state_input", False) else None
+    too_long: dict[int, tuple[str, int]] = {}
+    for task_index, prompt in prompts.items():
+        length = int(tokenizer.tokenize(prompt, state=state)[1].sum())
+        if length > max_len:
+            too_long[task_index] = (prompt, length)
+    if too_long:
+        needed = max(length for _, length in too_long.values())
+        shown = "; ".join(
+            f"task_index {i}: {length} tokens ({p[:60]!r}...)" for i, (p, length) in list(too_long.items())[:5]
+        )
+        raise ValueError(
+            f"{len(too_long)} task prompt(s) exceed max_token_len={max_len}"
+            f"{' together with the discretized state' if state is not None else ''} and would be truncated: {shown}. "
+            f"Pass --model.max-token-len {needed} (or more), or prompt with --data.prompt-source task_name."
+        )
+
+
 def save_prompt_source(assets_dir: Any, prompt_source: str) -> None:
     """Record ``prompt_source`` in a checkpoint's assets directory (next to ``norm_stats.json``)."""
     if prompt_source not in PROMPT_SOURCES:

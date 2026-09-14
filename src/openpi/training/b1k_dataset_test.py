@@ -292,6 +292,28 @@ def test_task_prompts_task_description_registry_fallback(full_root: pathlib.Path
     }
 
 
+def test_check_prompt_token_lengths():
+    from openpi.models import pi0_config
+
+    pi05 = pi0_config.Pi0Config(pi05=True, action_dim=32, max_token_len=200)
+    assert pi05.discrete_state_input
+    short = {0: "turning_on_radio", 1: "Turn on the radio receiver that's on the table in the living room."}
+    b1k_dataset.check_prompt_token_lengths(short, pi05)  # fits next to a worst-case 32-dim state
+    long_prompt = " ".join(["walk to the kitchen and open the fridge"] * 12)  # ~110 tokens
+    with pytest.raises(
+        ValueError, match="exceed max_token_len=200 together with the discretized state.*--model.max-token-len"
+    ):
+        b1k_dataset.check_prompt_token_lengths({**short, 2: long_prompt}, pi05)
+    b1k_dataset.check_prompt_token_lengths(
+        {2: long_prompt}, pi0_config.Pi0Config(pi05=True, action_dim=32, max_token_len=300)
+    )
+
+    pi0 = pi0_config.Pi0Config(action_dim=32, max_token_len=48)  # no state in the prompt, but a 48-token budget
+    b1k_dataset.check_prompt_token_lengths(short, pi0)
+    with pytest.raises(ValueError, match="exceed max_token_len=48 and would be truncated"):
+        b1k_dataset.check_prompt_token_lengths({2: long_prompt}, pi0)
+
+
 def test_prompt_source_record_round_trip(tmp_path: pathlib.Path):
     assets_dir = tmp_path / "assets" / "org" / "demos"
     assert b1k_dataset.load_prompt_source(assets_dir) is None  # checkpoints from before the record
