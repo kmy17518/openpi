@@ -13,6 +13,7 @@ import openpi.shared.download as _download
 from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper
 import openpi.shared.normalize as _normalize
 from openpi.training import config as _config
+import openpi.training.b1k_dataset as _b1k_dataset
 
 
 @dataclasses.dataclass
@@ -40,6 +41,13 @@ class Args:
     # stats (`<repo_id>/task_subsets/<key>`) inside the checkpoint assets. When the requested norm stats are not in
     # the checkpoint but it holds exactly one norm-stats file (the one training used), that file is served instead.
     task_names: list[str] | None = None
+    # Which text of the task to prompt the policy with: `task_name` (the snake_case id of `--task`, e.g.
+    # `turning_on_radio`) or `task_description` (its natural-language instruction from the task registry,
+    # `configs/tasks/b1k.py`). Default: what the checkpoint was trained with (`--data.prompt-source` of train_b1k.py,
+    # recorded in its assets); checkpoints that predate that record are served with `task_description`, as before.
+    prompt_source: _b1k_dataset.PromptSource | None = None
+    # Prompt the policy with exactly this text instead (overrides --prompt-source and the task registry).
+    text_prompt: str | None = None
     control_mode: str = "receding_horizon"
     # Number of actions to execute before replanning.
     action_horizon: int = 16
@@ -49,13 +57,19 @@ class Args:
     record: bool = False
 
 
-def resolve_norm_stats(config: _config.TrainConfig, checkpoint_dir: str) -> dict[str, _normalize.NormStats] | None:
-    """Norm stats to serve with.
+# Served text for checkpoints whose assets do not record a prompt source (trained before it existed): this script
+# has always prompted with the task description, so keep doing that; pass --prompt-source task_name to serve such a
+# checkpoint with the text it was actually trained on.
+LEGACY_PROMPT_SOURCE: _b1k_dataset.PromptSource = "task_description"
 
-    Returns None when the checkpoint holds the norm stats the config asks for (`assets/<asset_id>`, which
-    `create_trained_policy` then loads itself). Otherwise falls back to the checkpoint's only norm-stats file --
-    a checkpoint written by train_b1k.py saves exactly one, the one training used -- so a checkpoint trained with
-    `--data.task-names` also serves without `--task-names`. Ambiguous or empty assets raise with what is there.
+
+def resolve_assets_dir(config: _config.TrainConfig, checkpoint_dir: str) -> pathlib.Path:
+    """The checkpoint's assets directory (norm stats + recorded prompt source) to serve with.
+
+    `assets/<asset_id>` when the checkpoint holds it. Otherwise falls back to the checkpoint's only norm-stats
+    directory -- a checkpoint written by train_b1k.py saves exactly one, the one training used -- so a checkpoint
+    trained with `--data.task-names` also serves without `--task-names`. Ambiguous or empty assets raise with what
+    is there.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.asset_id is None:
@@ -65,7 +79,7 @@ def resolve_norm_stats(config: _config.TrainConfig, checkpoint_dir: str) -> dict
     assets_dir = pathlib.Path(_download.maybe_download(str(checkpoint_dir))) / "assets"
     requested = assets_dir / asset_id
     if (requested / "norm_stats.json").exists():
-        return None
+        return requested
     candidates = sorted(path.parent for path in assets_dir.rglob("norm_stats.json")) if assets_dir.is_dir() else []
     found = [path.relative_to(assets_dir).as_posix() for path in candidates]
     if len(candidates) == 1:
@@ -75,20 +89,43 @@ def resolve_norm_stats(config: _config.TrainConfig, checkpoint_dir: str) -> dict
             requested,
             found[0],
         )
-        return _normalize.load(candidates[0])
+        return candidates[0]
     raise FileNotFoundError(
         f"Norm stats not found at {requested}; the checkpoint holds {found or 'no norm stats'}. Pass --repo-id and, "
         "for a checkpoint trained on a task subset, --task-names matching the training run."
     )
 
 
-def main(args: Args) -> None:
-    # Load task from registry
-    task_bucket, task_name = args.task.split("/")
-    task_prompt = TASK_REGISTRY[task_bucket][task_name]
-    # log the prompt used
-    logging.info(f"Using robot: {args.robot}, prompt: {task_prompt}")
+def resolve_prompt(args: Args, assets_dir: pathlib.Path) -> tuple[str, str]:
+    """(prompt text, how it was chosen) for `--task <bucket>/<task_name>`.
 
+    Precedence: --text-prompt, --prompt-source, the prompt source recorded in the checkpoint assets, then
+    LEGACY_PROMPT_SOURCE.
+    """
+    task_bucket, task_name = args.task.split("/")
+    if args.text_prompt is not None:
+        return args.text_prompt, "--text-prompt"
+    if args.prompt_source is not None:
+        prompt_source, origin = args.prompt_source, "--prompt-source"
+    elif (recorded := _b1k_dataset.load_prompt_source(assets_dir)) is not None:
+        prompt_source, origin = (
+            recorded,
+            f"recorded in the checkpoint ({assets_dir / _b1k_dataset.PROMPT_SOURCE_FILENAME})",
+        )
+    else:
+        prompt_source, origin = LEGACY_PROMPT_SOURCE, "default for checkpoints without a recorded prompt source"
+    if prompt_source == "task_name":
+        return task_name, f"task_name ({origin})"
+    tasks = TASK_REGISTRY[task_bucket]
+    if task_name not in tasks:
+        raise KeyError(
+            f"No description for task {task_name!r} in TASK_REGISTRY[{task_bucket!r}] "
+            f"(src/openpi/configs/tasks/{task_bucket}.py); add it, or pass --prompt-source task_name / --text-prompt."
+        )
+    return tasks[task_name], f"task_description ({origin})"
+
+
+def main(args: Args) -> None:
     # Load training config and override request-specific fields.
     config = _config.get_config(args.policy.config)
     norm_stats_repo_id = args.repo_id or args.task
@@ -100,8 +137,12 @@ def main(args: Args) -> None:
         ),
     )
 
+    assets_dir = resolve_assets_dir(config, args.policy.dir)
+    task_prompt, prompt_origin = resolve_prompt(args, assets_dir)
+    logging.info("Using robot: %s, prompt: %r [%s]", args.robot, task_prompt, prompt_origin)
+
     policy = _policy_config.create_trained_policy(
-        config, args.policy.dir, default_prompt=task_prompt, norm_stats=resolve_norm_stats(config, args.policy.dir)
+        config, args.policy.dir, default_prompt=task_prompt, norm_stats=_normalize.load(assets_dir)
     )
     policy_metadata = policy.metadata
 

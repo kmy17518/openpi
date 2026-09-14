@@ -134,7 +134,9 @@ def create_b1k_dataset(data_config: _config.DataConfig, action_horizon: int) -> 
     The dataset is read from the local root `data_config.dataset_root` (the full download or a per-task partial
     download of the challenge demos). If `data_config.task_names` is set, only the episodes of those tasks are
     loaded (resolved against `meta/tasks.parquet` / `meta/episodes/`, so a misspelled name or a partial download
-    of other tasks fails here rather than mid-training).    """
+    of other tasks fails here rather than mid-training). Prompts follow `data_config.prompt_source` (task name or
+    natural-language description).
+    """
     if data_config.dataset_root is None:
         raise ValueError("dataset_root is not set. Pass --data.dataset-root=<local LeRobot root> for B1K datasets.")
     if isinstance(data_config.repo_id, list):
@@ -170,9 +172,20 @@ def create_b1k_dataset(data_config: _config.DataConfig, action_horizon: int) -> 
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(
-            dataset, [_transforms.PromptFromLeRobotTask(_lerobot_compat.tasks_from_metadata(dataset_meta))]
-        )
+        if isinstance(data_config.repo_id, list):
+            prompts = _lerobot_compat.tasks_from_metadata(dataset_meta)
+        else:
+            # Only the tasks actually trained on need a prompt: the selected subset, else every task on disk.
+            required = (
+                set(subset.task_indices)
+                if data_config.task_names
+                else set(_b1k_dataset.episode_task_indices(dataset_meta))
+            )
+            prompts = _b1k_dataset.task_prompts(dataset_meta, data_config.prompt_source, required)
+            logging.info(
+                "Prompting with %s, e.g. %r", data_config.prompt_source, prompts[min(required)] if required else None
+            )
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(prompts)])
 
     return dataset
 

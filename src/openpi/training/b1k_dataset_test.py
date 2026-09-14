@@ -234,6 +234,73 @@ def test_dataset_pickles_for_dataloader_workers(partial_root: pathlib.Path):
     assert torch.equal(clone[7]["observation.state"], ds[7]["observation.state"])
 
 
+DESCRIPTIONS = {
+    "turning_on_radio": "Turn on the radio receiver that's on the table in the living room.",
+    "picking_up_trash": "Put the three cans of soda from the living room inside the trash can in the kitchen.",
+    "chop_an_onion": "Dice the onion.",
+}
+
+
+def _write_tasks_jsonl(root: pathlib.Path, names: list[str] = TASKS) -> None:
+    lines = [
+        json.dumps({"task_index": TASKS.index(name), "task_name": name, "task": DESCRIPTIONS[name]}) for name in names
+    ]
+    (root / "meta" / "tasks.jsonl").write_text("\n".join(lines) + "\n")
+
+
+def test_task_prompts_task_name(full_root: pathlib.Path):
+    meta = b1k_dataset.B1KDatasetMetadata("org/demos", full_root)
+    assert b1k_dataset.task_prompts(meta) == dict(enumerate(TASKS))
+    assert b1k_dataset.task_prompts(meta, "task_name") == dict(enumerate(TASKS))
+    assert b1k_dataset.episode_task_indices(meta) == {0, 1, 2}
+    with pytest.raises(ValueError, match="Unknown prompt_source"):
+        b1k_dataset.task_prompts(meta, "description")
+
+
+def test_task_prompts_task_description_from_tasks_jsonl(full_root: pathlib.Path):
+    _write_tasks_jsonl(full_root)
+    meta = b1k_dataset.B1KDatasetMetadata("org/demos", full_root)
+    prompts = b1k_dataset.task_prompts(meta, "task_description")
+    assert prompts == {i: DESCRIPTIONS[name] for i, name in enumerate(TASKS)}
+    assert prompts[2] == "Dice the onion."  # the dataset's file wins over the registry copy
+
+    # A tasks.jsonl that disagrees with tasks.parquet on a task's name is rejected.
+    (full_root / "meta" / "tasks.jsonl").write_text(
+        json.dumps({"task_index": 0, "task_name": "picking_up_trash", "task": "wrong"}) + "\n"
+    )
+    with pytest.raises(ValueError, match="disagrees with meta/tasks.parquet on task_index 0"):
+        b1k_dataset.task_prompts(meta, "task_description")
+
+
+def test_task_prompts_task_description_registry_fallback(full_root: pathlib.Path, monkeypatch):
+    registry = {"turning_on_radio": "Radio.", "picking_up_trash": "Trash."}
+    monkeypatch.setitem(b1k_dataset.TASK_REGISTRY, b1k_dataset.TASK_REGISTRY_BUCKET, registry)
+    meta = b1k_dataset.B1KDatasetMetadata("org/demos", full_root)  # no meta/tasks.jsonl
+    # Only the tasks being trained on need a description.
+    assert b1k_dataset.task_prompts(meta, "task_description", required_task_indices=[0, 1]) == {
+        0: "Radio.",
+        1: "Trash.",
+    }
+    with pytest.raises(ValueError, match="No task description for task_index \\[2\\] \\(\\['chop_an_onion'\\]\\)"):
+        b1k_dataset.task_prompts(meta, "task_description")
+    # The dataset's file fills the gap and takes precedence over the registry.
+    _write_tasks_jsonl(full_root, ["chop_an_onion", "turning_on_radio"])
+    assert b1k_dataset.task_prompts(meta, "task_description") == {
+        0: DESCRIPTIONS["turning_on_radio"],
+        1: "Trash.",
+        2: "Dice the onion.",
+    }
+
+
+def test_prompt_source_record_round_trip(tmp_path: pathlib.Path):
+    assets_dir = tmp_path / "assets" / "org" / "demos"
+    assert b1k_dataset.load_prompt_source(assets_dir) is None  # checkpoints from before the record
+    b1k_dataset.save_prompt_source(assets_dir, "task_description")
+    assert b1k_dataset.load_prompt_source(assets_dir) == "task_description"
+    with pytest.raises(ValueError, match="Unknown prompt_source"):
+        b1k_dataset.save_prompt_source(assets_dir, "instruction")
+
+
 def test_dataset_missing_data_file_fails_fast(full_root: pathlib.Path):
     (full_root / "data" / "chunk-002" / "file-000.parquet").unlink()
     with pytest.raises(FileNotFoundError, match="1 data file\\(s\\).*chunk-002"):
