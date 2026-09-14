@@ -695,6 +695,10 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Save total limit: how many of the most recent checkpoints to keep on disk (older ones are deleted after each
+    # save; checkpoints matching `keep_period` are exempt). Each checkpoint holds params + optimizer state (~42 GB
+    # for pi05).
+    max_to_keep: int = 1
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False

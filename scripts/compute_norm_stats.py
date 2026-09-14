@@ -51,6 +51,7 @@ _LOWDIM_IRRELEVANT_DATASET_KWARGS = frozenset(
         "video_backend",
         "download_videos",
         "return_uint8",
+        "video_keys",
         "image_transforms",
         "revision",
         "force_cache_sync",
