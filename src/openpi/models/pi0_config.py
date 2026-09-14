@@ -32,6 +32,13 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Gradient-checkpointing policy for the Gemma and SigLIP transformer blocks (a `jax.checkpoint_policies` name, or
+    # "none" for no rematerialization). Training only; it changes what is saved between the forward and backward pass,
+    # not the math. "nothing_saveable" recomputes every block's forward in the backward pass (least memory);
+    # "dots_with_no_batch_dims_saveable" keeps the projection/MLP matmul outputs instead of recomputing them
+    # (roughly a fifth less compute per step, ~1.8 GB more memory per sample at pi05 shapes).
+    remat_policy: str = "nothing_saveable"
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):

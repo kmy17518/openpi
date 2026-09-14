@@ -342,9 +342,6 @@ def train_step(
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
-    model = nnx.merge(state.model_def, state.params)
-    model.train()
-
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
@@ -352,12 +349,43 @@ def train_step(
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss)
 
-    train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
-
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+
+    def loss_and_grads(micro_rng, observation, actions):
+        # Build the module at the current trace level: nnx transforms only accept Variables created at the trace they
+        # run in (and write the module's non-differentiated state, e.g. RNG counters, back into them afterwards), so
+        # inside the `lax.scan` body below this has to happen per iteration, not once outside. The tree_map re-creates
+        # the Variable objects (flax >= 0.11 keeps Variables inside `State`; on older flax it is a no-op copy).
+        model = nnx.merge(state.model_def, jax.tree.map(lambda x: x, state.params))
+        model.train()
+        loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, micro_rng, observation, actions)
+        return loss, grads, model
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions = batch
+    if config.grad_accum_steps == 1:
+        loss, grads, model = loss_and_grads(train_rng, observation, actions)
+    else:
+        # Gradient accumulation. `batch` is laid out as [grad_accum_steps, batch_size / grad_accum_steps, ...] (see
+        # `data_loader.TorchDataLoader`). With equal-sized micro-batches, the mean of their mean-loss gradients is the
+        # gradient of the mean loss over the whole batch, so the update equals the full-batch one up to floating-point
+        # summation order. Each micro-batch draws its own noise / timestep / augmentation randomness, exactly as the
+        # samples of one full batch do. Only one micro-batch's activations are live at a time, which is what lets a
+        # remat policy that saves more (`--model.remat-policy`) fit.
+        trainable = state.params.filter(config.trainable_filter)
+
+        def accumulate(carry, xs):
+            loss_sum, grads_sum = carry
+            micro_loss, micro_grads, _ = loss_and_grads(*xs)
+            return (loss_sum + micro_loss, jax.tree.map(jnp.add, grads_sum, micro_grads)), None
+
+        init = (jnp.zeros((), jnp.float32), jax.tree.map(jnp.zeros_like, trainable))
+        micro_rngs = jax.random.split(train_rng, config.grad_accum_steps)
+        (loss, grads), _ = jax.lax.scan(accumulate, init, (micro_rngs, observation, actions))
+        loss = loss / config.grad_accum_steps
+        grads = jax.tree.map(lambda g: g / config.grad_accum_steps, grads)
+        model = nnx.merge(state.model_def, state.params)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -401,9 +429,10 @@ def main(config: _config.TrainConfig):
     # (B300, compute capability 10.3) -- see openpi/shared/xla_gpu_compat.py.
     _xla_gpu_compat.configure_xla_flags()
 
-    if config.batch_size % jax.device_count() != 0:
+    if config.batch_size % (jax.device_count() * config.grad_accum_steps) != 0:
         raise ValueError(
-            f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
+            f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()} times "
+            f"grad_accum_steps {config.grad_accum_steps}."
         )
 
     # Persistent compilation cache: JAX_COMPILATION_CACHE_DIR if set, else jax's default location under ~/.cache.
@@ -417,6 +446,9 @@ def main(config: _config.TrainConfig):
 
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
+    # Sharding of the batches the data loader produces: [B, ...] or, with gradient accumulation,
+    # [grad_accum_steps, B / grad_accum_steps, ...] with the sample axis data-parallel.
+    batch_sharding = _data_loader.micro_batch_sharding(data_sharding, config.grad_accum_steps)
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
@@ -437,10 +469,15 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
+    # Log images from first batch to sanity check. Images are [B, h, w, c] or, with gradient accumulation,
+    # [grad_accum_steps, B / grad_accum_steps, h, w, c]; index the i-th sample of either layout.
+    def sample_image(img, i):
+        return img[i] if img.ndim == 4 else img[i // img.shape[1], i % img.shape[1]]
+
+    num_samples = int(np.prod(next(iter(batch[0].images.values())).shape[:-3]))
     images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        wandb.Image(np.concatenate([np.array(sample_image(img, i)) for img in batch[0].images.values()], axis=1))
+        for i in range(min(5, num_samples))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
@@ -451,9 +488,14 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    if config.prefetch_batches > 0:
+        # From here on the batches are pulled in a background thread (the torch loader's worker processes were started
+        # above, in the main thread, by the first `next`), so the hand-off overlaps with the running train step.
+        data_iter = _data_loader.PrefetchIterator(data_iter, depth=config.prefetch_batches)
+
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        in_shardings=(replicated_sharding, train_state_sharding, batch_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )

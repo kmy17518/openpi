@@ -2,6 +2,8 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import queue
+import threading
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -363,9 +365,21 @@ def create_b1k_data_loader(
         num_batches=num_batches,
         num_workers=config.num_workers,
         seed=config.seed,
+        micro_batches=config.grad_accum_steps,
     )
 
     return DataLoaderImpl(data_config, data_loader)
+
+
+def micro_batch_sharding(sharding: jax.sharding.NamedSharding, micro_batches: int) -> jax.sharding.NamedSharding:
+    """Sharding of a batch laid out as `[micro_batches, batch_size / micro_batches, ...]` (see `TorchDataLoader`).
+
+    The leading micro-batch axis is replicated and the sample axis keeps the given (data-parallel) sharding, so
+    each micro-batch is spread over all devices exactly like a plain `[batch_size, ...]` batch would be.
+    """
+    if micro_batches == 1:
+        return sharding
+    return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(None, *sharding.spec))
 
 
 def create_torch_data_loader(
@@ -493,6 +507,7 @@ class TorchDataLoader:
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        micro_batches: int = 1,
     ):
         """Create a PyTorch data loader.
 
@@ -508,12 +523,21 @@ class TorchDataLoader:
             num_workers: The number of worker processes to use. If zero, the data loader will
                 execute in the main process.
             seed: The seed to use for shuffling the data.
+            micro_batches: If greater than 1, every batch is returned as
+                `[micro_batches, local_batch_size / micro_batches, ...]` arrays (for gradient accumulation), with
+                the sample axis sharded as `sharding` says and the leading axis replicated
+                (see `micro_batch_sharding`).
         """
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+        if micro_batches < 1 or local_batch_size % micro_batches != 0:
+            raise ValueError(
+                f"Local batch size ({local_batch_size}) must be a multiple of micro_batches ({micro_batches})."
+            )
+        self._micro_batches = micro_batches
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
         self._sharding = sharding
@@ -523,6 +547,8 @@ class TorchDataLoader:
                 jax.sharding.Mesh(jax.devices(), ("B",)),
                 jax.sharding.PartitionSpec("B"),
             )
+        if self._sharding is not None:
+            self._sharding = micro_batch_sharding(self._sharding, micro_batches)
         self._num_batches = num_batches
 
         mp_context = None
@@ -561,6 +587,9 @@ class TorchDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
+                if self._micro_batches > 1:
+                    # [B, ...] -> [micro_batches, B / micro_batches, ...]; a view, the collated arrays are contiguous.
+                    batch = jax.tree.map(lambda x: x.reshape(self._micro_batches, -1, *x.shape[1:]), batch)
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
@@ -625,6 +654,42 @@ class RLDSDataLoader:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+
+
+class PrefetchIterator(Iterator[T_co]):
+    """Pulls items from `iterator` in a background thread, keeping up to `depth` of them ready.
+
+    Dispatching a jitted train step blocks the calling thread for most of the step on GPU (the host stays inside the
+    executable while its kernels are enqueued; only one or two steps run ahead), so the batch hand-off from the data
+    loader -- receiving the collated arrays from the worker process and putting them on the devices, ~0.05-0.5 s at
+    2048 samples, seconds when a worker is late -- would otherwise add directly to every step. Exceptions raised by
+    the iterator are re-raised from `__next__`.
+    """
+
+    def __init__(self, iterator: Iterator[T_co], depth: int = 2):
+        self._queue: queue.Queue = queue.Queue(maxsize=max(depth, 1))
+        self._end = object()
+        self._thread = threading.Thread(target=self._run, args=(iterator,), name="batch-prefetch", daemon=True)
+        self._thread.start()
+
+    def _run(self, iterator: Iterator[T_co]) -> None:
+        try:
+            for item in iterator:
+                self._queue.put(item)
+        except BaseException as e:  # forwarded to the consumer thread, re-raised there
+            self._queue.put(e)
+        self._queue.put(self._end)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> T_co:
+        item = self._queue.get()
+        if item is self._end:
+            raise StopIteration
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 class DataLoaderImpl(DataLoader):

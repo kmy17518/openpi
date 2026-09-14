@@ -673,9 +673,19 @@ class TrainConfig:
     seed: int = 42
     # Global batch size.
     batch_size: int = 32
+    # Number of micro-batches each optimizer step is accumulated over (gradient accumulation). The optimizer still
+    # sees `batch_size` samples per step -- the same update up to floating-point summation order -- but only
+    # `batch_size / grad_accum_steps` samples are resident on the devices at a time. Use it to run a large batch with
+    # a remat policy that saves more activations (`--model.remat-policy`) than the full batch would leave room for.
+    # `batch_size` must be divisible by `grad_accum_steps * number of devices`. B1K trainer (`train_b1k.py`) only.
+    grad_accum_steps: int = 1
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 8
+    # Batches the B1K trainer keeps ready on the devices, fetched by a background thread while the train step runs
+    # (dispatching a step blocks the main thread for most of it on GPU, so a synchronous hand-off would add to every
+    # step). 0 disables the thread. Each batch costs `batch_size` x images in float32 of device memory.
+    prefetch_batches: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
