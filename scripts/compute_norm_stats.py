@@ -3,7 +3,25 @@
 This script is used to compute the normalization statistics for a given config. It
 will compute the mean and standard deviation of the data in the dataset and save it
 to the config assets directory.
+
+    uv run scripts/compute_norm_stats.py <config_name> [--max-frames N] [--data.* overrides]
+
+The config's data settings can be overridden like for `scripts/b1k/train_b1k.py`, e.g. for the
+BEHAVIOR-1K challenge demos:
+
+    uv run scripts/compute_norm_stats.py pi05_b1k \\
+        --data.repo_id=behavior-1k/2026-challenge-demos --data.dataset-root=$DATA_ROOT \\
+        --data.task-names turning_on_radio
+
+Stats of a task subset are written under `outputs/assets/<config>/<repo_id>/task_subsets/<key>/`
+(computed over the selected tasks' episodes only), stats of the whole dataset under
+`outputs/assets/<config>/<repo_id>/`; training and serving resolve the same directory from the
+same `--data.*` flags.
 """
+
+from collections.abc import Sequence
+import dataclasses
+import sys
 
 import numpy as np
 import tqdm
@@ -131,8 +149,46 @@ def create_b1k_dataloader(
     )
     return data_loader, num_batches
 
-def main(config_name: str, max_frames: int | None = None):
-    config = _config.get_config(config_name)
+
+@dataclasses.dataclass(frozen=True)
+class Args:
+    """Arguments of compute_norm_stats.py; the positional config name selects the defaults."""
+
+    # Name of the training config the stats are for (selected as the CLI subcommand).
+    config_name: tyro.conf.Suppress[str]
+    # The config's data settings. Override them like for train_b1k.py, e.g. --data.repo_id, --data.dataset-root,
+    # --data.task-names (B1K).
+    data: _config.DataConfigFactory
+    # If set, compute the stats over at most this many (randomly sampled) frames instead of the whole dataset.
+    max_frames: int | None = None
+
+
+def cli(argv: Sequence[str] | None = None) -> Args:
+    """Parse `<config_name> [--max-frames N] [--data.* overrides]` (same shape as scripts/train.py).
+
+    The former flag form `--config-name <name>` (upstream README) is still accepted and rewritten to the
+    positional form.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    for i, arg in enumerate(argv):
+        if arg == "--config-name" and i + 1 < len(argv):
+            argv = [argv[i + 1], *argv[:i], *argv[i + 2 :]]
+            break
+        if arg.startswith("--config-name="):
+            argv = [arg.split("=", 1)[1], *argv[:i], *argv[i + 1 :]]
+            break
+    return tyro.extras.overridable_config_cli(
+        {
+            name: (name, Args(config_name=name, data=config.data))
+            for name, config in _config._CONFIGS_DICT.items()  # noqa: SLF001
+        },
+        args=argv,
+    )
+
+
+def main(args: Args):
+    config = dataclasses.replace(_config.get_config(args.config_name), data=args.data)
+    max_frames = args.max_frames
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
@@ -158,9 +214,11 @@ def main(config_name: str, max_frames: int | None = None):
 
     asset_id = resolve_asset_id(data_config)
     output_path = config.assets_dirs / asset_id
+    if data_config.task_names:
+        print(f"Stats computed over task subset {list(data_config.task_names)} only")
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    main(cli())

@@ -6,7 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from typing import Any, List, Literal, Protocol, TypeAlias
+from typing import Annotated, Any, List, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -24,6 +24,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.training.b1k_dataset as _b1k_dataset
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.lerobot_compat as _lerobot_compat
 import openpi.training.misc.polaris_config as polaris_config
@@ -101,13 +102,18 @@ class DataConfig:
     datasets: Sequence[droid_rlds_dataset.RLDSDataset | _lerobot_compat.LeRobotDataset] = ()
 
     # ============== Behavior Dataset Params ==================
-    # Dataset class to use for loading the behavior-style lerobot dataset
-    data_cls: Any = _lerobot_compat.LeRobotDataset
+    # Dataset class to use for loading the behavior-style lerobot dataset. The default reads local roots only and
+    # copes with per-task partial downloads of the challenge demos (see openpi.training.b1k_dataset).
+    data_cls: Any = _b1k_dataset.B1KLeRobotDataset
     # Path to local copy of the dataset
     # Note that this includes repo_id if LeRobotDataset and not include repo_id if MultiLeRobotDataset
     dataset_root: str | None = None
     # Extra kwargs to pass into the dataset constructor, if using a custom dataset class that requires additional arguments.
     dataset_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Train only on these tasks of the dataset under `dataset_root` (task strings as in `meta/tasks.parquet`, e.g.
+    # "turning_on_radio"). None: every task on disk. Works the same on the full 100-task root and on a per-task
+    # partial download; norm stats of a subset are kept under their own asset id (`<repo_id>/task_subsets/<key>`).
+    task_names: Sequence[str] | None = None
 
 
 class GroupFactory(Protocol):
@@ -377,6 +383,38 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     robot_config_name: str = tyro.MISSING
     extra_delta_transform: bool = True
     action_sequence_keys: Sequence[str] = ("action",)
+    # Local LeRobot v3.0 root (`data/`, `meta/`, `videos/`): the full challenge-demos download or a per-task partial
+    # download of it. Overrides `base_config.dataset_root`. CLI: --data.dataset-root PATH; the challenge docs'
+    # spelling `--data.base_config.dataset_root=PATH` is accepted as an alias (`base_config` itself is not exposed).
+    dataset_root: Annotated[str | None, tyro.conf.arg(aliases=["--data.base-config.dataset-root"])] = None
+    # Train only on these tasks (task strings as in `meta/tasks.parquet`, e.g. `turning_on_radio`); default: every
+    # task under `dataset_root`. Only the selected tasks' episodes are loaded and their norm stats are computed over
+    # those episodes alone, under the asset id `<repo_id>/task_subsets/<key>`. Unknown names, or a root that holds
+    # none of the selected tasks (a partial download of other tasks), fail fast. Overrides `base_config.task_names`.
+    # CLI: --data.task-names TASK [TASK ...]
+    task_names: Sequence[str] | None = None
+
+    @override
+    def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_config = self.base_config or DataConfig()
+        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        dataset_root = self.dataset_root if self.dataset_root is not None else base_config.dataset_root
+        task_names = _b1k_dataset.normalize_task_names(
+            self.task_names if self.task_names is not None else base_config.task_names
+        )
+        asset_id = self.assets.asset_id
+        if asset_id is None and repo_id is not None:
+            # A task subset has its own norm stats: `<repo_id>/task_subsets/<key>` (`<repo_id>` for the whole dataset).
+            asset_id = repo_id if isinstance(repo_id, list) else _b1k_dataset.task_subset_asset_id(repo_id, task_names)
+        return dataclasses.replace(
+            base_config,
+            repo_id=repo_id,
+            asset_id=asset_id,
+            dataset_root=dataset_root,
+            task_names=task_names,
+            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            use_quantile_norm=model_config.model_type != ModelType.PI0,
+        )
 
     def _build_delta_mappings(self, robot_config) -> list[tuple[list[int], list[int]]]:
         """(action_indices, state_indices) pairs for `MappedDeltaActions` / `MappedAbsoluteActions`.
@@ -777,10 +815,14 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_b1k",
         model=pi0_config.Pi0Config(action_horizon=32, pi05=True),
+        # Pass the dataset location on the command line, e.g. for the challenge demos
+        #   --data.repo_id=behavior-1k/2026-challenge-demos --data.dataset-root=$DATA_ROOT [--data.task-names $TASK]
+        # (`repo_id` names the norm-stats asset, `dataset_root` the local LeRobot root: the full 100-task download or a
+        # per-task partial download; `--data.task-names` restricts training to some tasks on either layout).
         data=LeRobotB1KDataConfig(
             repo_id="turning_on_radio",
             base_config=DataConfig(
-                data_cls=_lerobot_compat.LeRobotDataset,
+                data_cls=_b1k_dataset.B1KLeRobotDataset,
                 dataset_root="/viscam/u/shiyuc/openpi/2026-challenge-demos/b1k/turning_on_radio",
                 prompt_from_task=True,
                 # Frames are looked up by their absolute timestamp inside the per-file mp4s, and lerobot compares those

@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.training.b1k_dataset as _b1k_dataset
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.training.lerobot_compat as _lerobot_compat
@@ -128,17 +129,38 @@ class FakeDataset(Dataset):
 
 
 def create_b1k_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
-    """Create a behavior dataset for training."""
+    """Create a behavior dataset for training.
+
+    The dataset is read from the local root `data_config.dataset_root` (the full download or a per-task partial
+    download of the challenge demos). If `data_config.task_names` is set, only the episodes of those tasks are
+    loaded (resolved against `meta/tasks.parquet` / `meta/episodes/`, so a misspelled name or a partial download
+    of other tasks fails here rather than mid-training).    """
+    if data_config.dataset_root is None:
+        raise ValueError("dataset_root is not set. Pass --data.dataset-root=<local LeRobot root> for B1K datasets.")
     if isinstance(data_config.repo_id, list):
+        if data_config.task_names:
+            raise NotImplementedError("task_names is not supported with a list of repo_ids (MultiLeRobotDataset).")
         dataset_meta = _lerobot_compat.LeRobotDatasetMetadata(
             repo_id=data_config.repo_id[0], root=os.path.join(data_config.dataset_root, data_config.repo_id[0])
         )
         dataset_kwargs = {"repo_ids": data_config.repo_id, **data_config.dataset_kwargs}
     else:
-        dataset_meta = _lerobot_compat.LeRobotDatasetMetadata(
-            repo_id=data_config.repo_id, root=data_config.dataset_root
-        )
+        dataset_meta = _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root)
         dataset_kwargs = {"repo_id": data_config.repo_id, **data_config.dataset_kwargs}
+        if data_config.task_names:
+            subset = _b1k_dataset.select_task_subset(dataset_meta, data_config.task_names)
+            episodes = set(subset.episode_indices)
+            if (explicit := dataset_kwargs.get("episodes")) is not None:
+                episodes &= {int(ep) for ep in explicit}
+            dataset_kwargs["episodes"] = sorted(episodes)
+            logging.info(
+                "Task subset %s (task_index %s): %d of %d episodes under %s",
+                list(subset.task_names),
+                sorted(subset.task_indices),
+                len(dataset_kwargs["episodes"]),
+                len(dataset_meta.episodes),
+                data_config.dataset_root,
+            )
     dataset = data_config.data_cls(
         root=data_config.dataset_root,
         delta_timestamps={
@@ -200,15 +222,20 @@ def create_rlds_dataset(
     )
 
 
+def _missing_norm_stats_message(data_config: _config.DataConfig) -> str:
+    subset = f" (task subset {list(data_config.task_names)})" if data_config.task_names else ""
+    return (
+        f"Normalization stats not found for asset id {data_config.asset_id!r}{subset}. Make sure to run "
+        "`scripts/compute_norm_stats.py <config_name>` first, with the same --data.* flags as training."
+    )
+
+
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
-            raise ValueError(
-                "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
-            )
+            raise ValueError(_missing_norm_stats_message(data_config))
         norm_stats = data_config.norm_stats
 
     return TransformedDataset(
@@ -233,10 +260,7 @@ def transform_iterable_dataset(
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
-            raise ValueError(
-                "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
-            )
+            raise ValueError(_missing_norm_stats_message(data_config))
         norm_stats = data_config.norm_stats
 
     return IterableTransformedDataset(
