@@ -2,7 +2,7 @@
 
 This tutorial walks through fine-tuning [π₀.₅](https://www.physicalintelligence.company/blog/pi05) on demonstration data from [BEHAVIOR-1K](https://github.com/StanfordVL/BEHAVIOR-1K) using this repository.
 
-**Last updated:** June 2026  
+**Last updated:** September 2026  
 **OpenPi model:** π₀.₅ (`pi05`)  
 **Robot:** R1Pro (dual-arm mobile manipulator)
 
@@ -35,6 +35,8 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
 `GIT_LFS_SKIP_SMUDGE=1` is required because LeRobot is pulled in as a dependency.
+
+On ARM Linux hosts (aarch64, e.g. NVIDIA Grace) and on B300 GPUs the pinned toolchain needs the adjustments described in [Blackwell Ultra (B300) and ARM hosts](#blackwell-ultra-b300-and-arm-aarch64-hosts); they are part of this checkout and no-ops elsewhere.
 
 ---
 
@@ -230,7 +232,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/b1k/train_b1k.py <CONFIG_NAME>
     --data.task-names <TASK_NAME>
 ```
 
-`--data.task-names <TASK_NAME>` restricts training to that task whether `<DATASET_ROOT>` is a per-task partial download or the full 100-task root (see [above](#which-demos-are-on-disk-one-task-or-all-100)); drop it to train on every task under the root. Use the same `--data.*` flags as for `compute_norm_stats.py` so training finds the matching statistics.
+`--data.task-names <TASK_NAME>` restricts training to that task whether `<DATASET_ROOT>` is a per-task partial download or the full 100-task root (see [above](#which-demos-are-on-disk-one-task-or-all-100)); drop it to train on every task under the root. Use the same `--data.*` flags as for `compute_norm_stats.py` so training finds the matching statistics. The challenge docs spell the dataset flag `--data.base_config.dataset_root=<DATASET_ROOT>`; both scripts accept that as an alias of `--data.dataset-root`.
 
 Checkpoints are saved under:
 
@@ -324,6 +326,34 @@ Point your BEHAVIOR-1K robot client at the server host and port to stream observ
 
 ---
 
+### Blackwell Ultra (B300) and ARM (aarch64) hosts
+
+The pinned toolchain — `jax[cuda12]==0.5.3`, `torch==2.7.1+cu128`, `torchcodec 0.11` — predates NVIDIA's Blackwell Ultra GPUs (B300, CUDA compute capability 10.3) and has gaps on ARM Linux (aarch64, e.g. NVIDIA Grace CPUs). Run unchanged on such a host, the π₀.₅ walkthrough of the challenge docs fails at every stage: `uv sync` (no aarch64 wheel for triton), training and serving (XLA aborts while compiling the first matrix multiply), and data loading (video decoding so slow that the GPU idles). The changes below, all in this checkout, make the stock `compute_norm_stats.py` → `train_b1k.py` / `train_b1k.sh` → `serve_b1k.py` commands work as documented. On x86-64 hosts with GPUs that jax 0.5.3 already knows (A100, H100, H200, B200) they change nothing except the two path fixes (`train_b1k.sh` venv, JAX cache directory) and the accepted flag spelling.
+
+| Symptom on a B300 / aarch64 host | Cause | Change |
+|-----------------------------------|-------|--------|
+| `uv sync`: `Distribution triton==3.3.1 @ registry+https://pypi.org/simple can't be installed because it doesn't have a source distribution or wheel for the current platform` | PyPI ships only x86-64 wheels for the triton that `torch==2.7.1` requires; PyTorch's own index has aarch64 wheels | `pyproject.toml` declares PyTorch's cu128 index (`[[tool.uv.index]] pytorch-cu128`, `explicit = true`) and pins `torch` (Linux) and `triton` (Linux/aarch64) to it. `triton` is listed as a direct dependency behind the same marker because uv ignores index pins for purely transitive packages. `uv.lock` was re-locked (`GIT_LFS_SKIP_SMUDGE=1 uv lock`). |
+| Training or serving dies with exit code 134 at the first jitted matmul. Log: `Unknown compute capability 10.3. Defaulting to telling LLVM that we're compiling for sm_101`, then `F ... gemm_fusion_autotuner.cc ... ptxas exited with non-zero error code ... Instruction 'tcgen05.alloc' not supported on .target 'sm_101'` | XLA in jax 0.5.3 does not know compute capability 10.3 and falls back to the `sm_101` target, but its Triton GEMM emitter still generates Blackwell `tcgen05` instructions for it, so ptxas rejects every autotuner candidate | New `src/openpi/shared/xla_gpu_compat.py`. `configure_xla_flags()` reads the compute capability of every visible GPU through the CUDA driver API (no CUDA context, honours `CUDA_VISIBLE_DEVICES`) and, for 10.3, appends `--xla_gpu_enable_triton_gemm=false` to `XLA_FLAGS` so matrix multiplies run through cuBLAS; everything else XLA generates compiles fine for the fallback target. `train_b1k.py` and `serve_b1k.py` call it before their first JAX device query. An explicit `--xla_gpu_enable_triton_gemm=...` already present in `XLA_FLAGS` is left alone (that is the override, e.g. after upgrading jax). |
+| The first batch takes ~4.5 min, then 20–40 s/step with the GPU at 0 %. Log: `torchcodec is installed but cannot be loaded ...; decoding videos with pyav` | torchcodec's wheel does not load against this torch on aarch64, so `B1KLeRobotDataset` decodes with PyAV (this fallback already existed). `torchvision.io` — imported by lerobot — calls `av.logging.set_level(av.logging.ERROR)` at import time, which installs PyAV's Python log callback. That callback takes the GIL for *every* FFmpeg log line, and libavformat emits tens of thousands of TRACE-level lines while parsing one mp4 header; with lerobot decoding the six camera streams of a sample in six threads (and 8 data-loader workers) the GIL round-trips make each `av.open` take 1–4 s (measured: 6 concurrent opens 6 ms → 2.3 s once torchvision is imported; 3.8 s per sample, 0.03 s of which is decoding) | `B1KLeRobotDataset`'s reader restores PyAV's default no-op log callback (`av.logging.set_level(None)`, `quiet_pyav_logging()` in `b1k_dataset.py`) before decoding with the `pyav` backend — once per process, so data-loader workers (which re-import torchvision) are covered too. Only PyAV's error-message bookkeeping is lost. Result on this host: 0.03 s per sample, first batch in ~45 s. |
+| `./scripts/b1k/train_b1k.sh ...`: `source: /home/ubuntu/jiajun-stanford-lab/Research/openpi/.venv/bin/activate: No such file or directory` | hard-coded developer path | The script activates `<OPENPI_DIR>/.venv` relative to its own location when that exists; `uv run` uses it either way. |
+| `train_b1k.py` writes the JAX compilation cache to `~/.cache/jax` regardless of `JAX_COMPILATION_CACHE_DIR` | hard-coded path | Honours `JAX_COMPILATION_CACHE_DIR` when set, like `scripts/train.py` already did. |
+| `Unrecognized options: --data.base-config.dataset-root=...` for the commands copied from the challenge docs | `base_config` is not exposed on the CLI (it holds transforms and norm stats) | `--data.base_config.dataset_root` is an alias of `--data.dataset-root` on `LeRobotB1KDataConfig` (`compute_norm_stats.py` and `train_b1k.py`). |
+
+Not GPU-specific, but needed on a host whose `WANDB_BASE_URL` points at a server the `WANDB_API_KEY` is not valid for: `wandb.init` fails with `CommError: returned error 401`; run with `WANDB_MODE=offline` (sync later with `wandb sync`) or pass `--no-wandb-enabled`.
+
+Verified on a 4× B300 aarch64 host with the single-task `chop_an_onion` download (`--data.repo_id=behavior-1k/2026-challenge-demos --data.base_config.dataset_root=<DATASET_ROOT>`), everything else as in the challenge docs:
+
+| Command | Result |
+|---------|--------|
+| `uv run scripts/compute_norm_stats.py pi05_b1k ...` | 1,279,960 frames (200 episodes) in ~35 s |
+| `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/b1k/train_b1k.py pi05_b1k --exp_name=... --overwrite --batch_size=64 ...` (1 GPU) | data loader ready in ~45 s, 1.2 s/step at batch 64; checkpoint + resume (`--resume`) work |
+| `./scripts/b1k/train_b1k.sh pi05_b1k 4 0,1,2,3 ...` | 4 GPUs at 100 %, 0.42 s/step (2.4 it/s) at global batch 64 |
+| `CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 uv run scripts/b1k/serve_b1k.py --robot b1k/R1Pro --task b1k/<TASK_NAME> --repo-id <REPO_ID> --policy.config pi05_b1k --policy.dir <CHECKPOINT_DIR> --control_mode receding_horizon --action_horizon 16 --port 8000` | serves; first request ~5 s (JIT), then ~30 ms per step averaged over the receding horizon |
+
+Known limits: `scripts/train.py` and `scripts/serve_policy.py` (the non-B1K entry points) do not call `configure_xla_flags()` — export `XLA_FLAGS=--xla_gpu_enable_triton_gemm=false` yourself or add the call. `torch.compile` and the PyTorch training path (`scripts/train_pytorch.py`) were not exercised; the bundled triton 3.3.1 does not target compute capability 10.3 either. The `Unknown compute capability 10.3` warning itself keeps being printed by XLA once per compiled kernel and is harmless.
+
+---
+
 ### Quick reference
 
 | Item | Value |
@@ -351,5 +381,9 @@ Point your BEHAVIOR-1K robot client at the server host and port to stream observ
 | Task prompt not found at serve time | Add `<TASK_NAME>` to `src/openpi/configs/tasks/b1k.py` under the `b1k` bucket, or serve with `--prompt-source task_name` / `--text-prompt` |
 | `task prompt(s) exceed max_token_len` | The instruction plus the discretized state does not fit; pass the suggested `--model.max-token-len`, or train with `--data.prompt-source task_name` |
 | Out of GPU memory | Reduce `--batch_size` or set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` |
+| Exit code 134 with `Unknown compute capability 10.3` and `ptxas ... 'tcgen05.alloc' not supported on .target 'sm_101'` | B300 GPU with the pinned jax; `train_b1k.py` / `serve_b1k.py` handle it, other entry points need `XLA_FLAGS=--xla_gpu_enable_triton_gemm=false` (see [B300 and ARM hosts](#blackwell-ultra-b300-and-arm-aarch64-hosts)) |
+| Minutes per batch, GPU idle, `decoding videos with pyav` in the log | PyAV log-callback contention (fixed in `B1KLeRobotDataset`); if it persists, check that `av.logging.get_level()` is `None` in the worker processes |
+| `Unrecognized options: --data.base-config.dataset-root` | Older checkout; use `--data.dataset-root` (both spellings work here) |
+| `wandb.init` fails with `CommError: returned error 401` | `WANDB_API_KEY` does not match `WANDB_BASE_URL`; use `WANDB_MODE=offline` or `--no-wandb-enabled` |
 
 For general fine-tuning concepts (LeRobot conversion, config structure, remote inference), see the [main README](../README.md) and [remote inference docs](./remote_inference.md).

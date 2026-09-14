@@ -12,6 +12,7 @@ from openpi.serving import websocket_b1k_server
 import openpi.shared.download as _download
 from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper
 import openpi.shared.normalize as _normalize
+import openpi.shared.xla_gpu_compat as _xla_gpu_compat
 from openpi.training import config as _config
 import openpi.training.b1k_dataset as _b1k_dataset
 
@@ -126,6 +127,10 @@ def resolve_prompt(args: Args, assets_dir: pathlib.Path) -> tuple[str, str]:
 
 
 def main(args: Args) -> None:
+    # Before the policy is loaded onto the GPU: works around XLA aborting on GPUs newer than the pinned jax
+    # (B300, compute capability 10.3) -- see openpi/shared/xla_gpu_compat.py.
+    _xla_gpu_compat.configure_xla_flags()
+
     # Load training config and override request-specific fields.
     config = _config.get_config(args.policy.config)
     norm_stats_repo_id = args.repo_id or args.task

@@ -88,7 +88,13 @@ else
 fi
 echo "Running with args: ${TRAIN_ARGS[*]}"
 
-source /home/ubuntu/jiajun-stanford-lab/Research/openpi/.venv/bin/activate
+# Activate this checkout's venv (the one `uv sync` created next to this script) if it exists; `uv run` below syncs
+# and uses it either way. Runs from any checkout location instead of one developer's home directory.
+OPENPI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [ -f "$OPENPI_DIR/.venv/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "$OPENPI_DIR/.venv/bin/activate"
+fi
 
 export CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
 

@@ -6,7 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from typing import Any, List, Literal, Protocol, TypeAlias
+from typing import Annotated, Any, List, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -389,8 +389,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     extra_delta_transform: bool = True
     action_sequence_keys: Sequence[str] = ("action",)
     # Local LeRobot v3.0 root (`data/`, `meta/`, `videos/`): the full challenge-demos download or a per-task partial
-    # download of it. Overrides `base_config.dataset_root`. CLI: --data.dataset-root PATH
-    dataset_root: str | None = None
+    # download of it. Overrides `base_config.dataset_root`. CLI: --data.dataset-root PATH; the challenge docs'
+    # spelling `--data.base_config.dataset_root=PATH` is accepted as an alias (`base_config` itself is not exposed).
+    dataset_root: Annotated[str | None, tyro.conf.arg(aliases=["--data.base-config.dataset-root"])] = None
     # Train only on these tasks (task strings as in `meta/tasks.parquet`, e.g. `turning_on_radio`); default: every
     # task under `dataset_root`. Only the selected tasks' episodes are loaded and their norm stats are computed over
     # those episodes alone, under the asset id `<repo_id>/task_subsets/<key>`. Unknown names, or a root that holds

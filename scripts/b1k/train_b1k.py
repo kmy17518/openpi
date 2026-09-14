@@ -18,6 +18,7 @@ import wandb
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+import openpi.shared.xla_gpu_compat as _xla_gpu_compat
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -396,12 +397,20 @@ def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
+    # Must precede the first JAX device query below: works around XLA aborting on GPUs newer than the pinned jax
+    # (B300, compute capability 10.3) -- see openpi/shared/xla_gpu_compat.py.
+    _xla_gpu_compat.configure_xla_flags()
+
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # Persistent compilation cache: JAX_COMPILATION_CACHE_DIR if set, else jax's default location under ~/.cache.
+    jax.config.update(
+        "jax_compilation_cache_dir",
+        str(epath.Path(jax.config.jax_compilation_cache_dir or "~/.cache/jax").expanduser()),
+    )
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
