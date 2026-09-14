@@ -128,13 +128,18 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_b1k_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
+def create_b1k_dataset(
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig | None = None
+) -> Dataset:
     """Create a behavior dataset for training.
 
     The dataset is read from the local root `data_config.dataset_root` (the full download or a per-task partial
     download of the challenge demos). If `data_config.task_names` is set, only the episodes of those tasks are
     loaded (resolved against `meta/tasks.parquet` / `meta/episodes/`, so a misspelled name or a partial download
-    of other tasks fails here rather than mid-training).    """
+    of other tasks fails here rather than mid-training). Prompts follow `data_config.prompt_source` (task name or
+    natural-language description); when `model_config` is given, prompts that would not fit its `max_token_len`
+    are rejected up front.
+    """
     if data_config.dataset_root is None:
         raise ValueError("dataset_root is not set. Pass --data.dataset-root=<local LeRobot root> for B1K datasets.")
     if isinstance(data_config.repo_id, list):
@@ -170,9 +175,22 @@ def create_b1k_dataset(data_config: _config.DataConfig, action_horizon: int) -> 
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(
-            dataset, [_transforms.PromptFromLeRobotTask(_lerobot_compat.tasks_from_metadata(dataset_meta))]
-        )
+        if isinstance(data_config.repo_id, list):
+            prompts = _lerobot_compat.tasks_from_metadata(dataset_meta)
+        else:
+            # Only the tasks actually trained on need a prompt: the selected subset, else every task on disk.
+            required = (
+                set(subset.task_indices)
+                if data_config.task_names
+                else set(_b1k_dataset.episode_task_indices(dataset_meta))
+            )
+            prompts = _b1k_dataset.task_prompts(dataset_meta, data_config.prompt_source, required)
+            logging.info(
+                "Prompting with %s, e.g. %r", data_config.prompt_source, prompts[min(required)] if required else None
+            )
+            if model_config is not None:
+                _b1k_dataset.check_prompt_token_lengths({i: prompts[i] for i in required}, model_config)
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(prompts)])
 
     return dataset
 
@@ -332,7 +350,9 @@ def create_b1k_data_loader(
     skip_norm_stats: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     data_config = config.data.create(config.assets_dirs, config.model)
-    dataset = create_b1k_dataset(data_config=data_config, action_horizon=config.model.action_horizon)
+    dataset = create_b1k_dataset(
+        data_config=data_config, action_horizon=config.model.action_horizon, model_config=config.model
+    )
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(

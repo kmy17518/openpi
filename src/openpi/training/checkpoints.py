@@ -13,6 +13,7 @@ import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
+import openpi.training.b1k_dataset as _b1k_dataset
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
@@ -75,6 +76,10 @@ def save_state(
         if norm_stats is not None and data_config.asset_id is not None:
             asset_id = data_config.asset_id if isinstance(data_config.asset_id, str) else data_config.asset_id[0]
             _normalize.save(directory / asset_id, norm_stats)
+            # Record which text of a LeRobot task the policy was prompted with (task name vs. description, see
+            # openpi.training.b1k_dataset) so that serving prompts with the same kind of text.
+            if data_config.prompt_from_task:
+                _b1k_dataset.save_prompt_source(directory / asset_id, data_config.prompt_source)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():

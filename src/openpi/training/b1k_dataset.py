@@ -23,10 +23,11 @@ selected episodes (a one-task subset of the full root opens 6 parquet files inst
 from collections.abc import Iterable, Sequence
 import dataclasses
 import hashlib
+import json
 import logging
 import pathlib
 import re
-from typing import Any
+from typing import Any, Literal, get_args
 
 import datasets
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
@@ -38,6 +39,22 @@ from lerobot.utils.utils import SuppressProgressBars
 import numpy as np
 import pyarrow.dataset as pa_ds
 import torch
+
+from openpi.configs.tasks import TASK_REGISTRY
+
+# Which text of a BEHAVIOR task the policy is conditioned on (the two kinds shipped per task in the demos'
+# ``meta/tasks.jsonl``; see :func:`task_prompts`):
+#   task_name        -- the LeRobot task string of ``meta/tasks.parquet``, for the challenge demos the snake_case
+#                       id, e.g. ``turning_on_radio`` (stock openpi ``prompt_from_task`` behavior);
+#   task_description -- the natural-language instruction, e.g. "Turn on the radio receiver that's on the table in
+#                       the living room.", from ``meta/tasks.jsonl`` (fallback: openpi's ``TASK_REGISTRY["b1k"]``).
+PromptSource = Literal["task_name", "task_description"]
+PROMPT_SOURCES: tuple[str, ...] = get_args(PromptSource)
+DEFAULT_PROMPT_SOURCE: PromptSource = "task_name"
+TASKS_JSONL_FILENAME = "tasks.jsonl"
+# Written next to ``norm_stats.json`` in a checkpoint's assets so serving can pick the same kind of text.
+PROMPT_SOURCE_FILENAME = "prompt_source.json"
+TASK_REGISTRY_BUCKET = "b1k"
 
 # Norm stats of a task subset live under ``<repo_id>/task_subsets/<key>/`` (mirrors the GR00T baseline's
 # ``meta/task_subsets/<key>/``), so per-task statistics never shadow the dataset-wide ones and different
@@ -148,6 +165,134 @@ def select_task_subset(meta: LeRobotDatasetMetadata, task_names: str | Iterable[
             f"{len(episode_indices)} episodes on disk belong to {on_disk} -- is this a partial download of other tasks?"
         )
     return TaskSubset(task_names=names, task_indices=task_indices, episode_indices=tuple(sorted(selected)))
+
+
+def episode_task_indices(meta: LeRobotDatasetMetadata) -> set[int]:
+    """``task_index`` values of the episodes on disk (falls back to every task of ``meta/tasks.parquet`` when the
+    episode metadata does not carry ``task_index``)."""
+    if "task_index" in meta.episodes.column_names:
+        return {int(task) for task in _column(meta.episodes, "task_index")}
+    return set(task_names_by_index(meta.tasks))
+
+
+def task_names_by_index(tasks: Any) -> dict[int, str]:
+    """``task_index -> task string`` of ``LeRobotDatasetMetadata.tasks`` (``meta/tasks.parquet``)."""
+    return {
+        int(task_index): str(task_str) for task_str, task_index in zip(tasks.index, tasks["task_index"], strict=True)
+    }
+
+
+def load_task_descriptions(root: str | pathlib.Path, task_names: dict[int, str]) -> dict[int, str] | None:
+    """``task_index -> natural-language description`` from ``meta/tasks.jsonl``, or None if the file is absent.
+
+    Each line is ``{"task_index", "task_name", "task"}`` (``task`` being the description). Rows are checked
+    against ``task_names`` (``meta/tasks.parquet``) so a stale or foreign ``tasks.jsonl`` cannot silently attach
+    the wrong instruction to a task.
+    """
+    path = pathlib.Path(root) / "meta" / TASKS_JSONL_FILENAME
+    if not path.is_file():
+        return None
+    descriptions: dict[int, str] = {}
+    with path.open() as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            task_index = int(row["task_index"])
+            expected = task_names.get(task_index)
+            if expected is not None and "task_name" in row and str(row["task_name"]) != expected:
+                raise ValueError(
+                    f"{path} disagrees with meta/tasks.parquet on task_index {task_index}: "
+                    f"{row['task_name']!r} vs {expected!r}"
+                )
+            descriptions[task_index] = str(row["task"])
+    return descriptions
+
+
+def task_prompts(
+    meta: LeRobotDatasetMetadata,
+    prompt_source: str = DEFAULT_PROMPT_SOURCE,
+    required_task_indices: Iterable[int] | None = None,
+) -> dict[int, str]:
+    """``task_index -> prompt text`` for ``PromptFromLeRobotTask``.
+
+    ``task_name``: the task string of ``meta/tasks.parquet``. ``task_description``: the instruction of the
+    dataset's ``meta/tasks.jsonl``; for tasks it lacks (or if the file is absent, e.g. an older download),
+    openpi's task registry (``configs/tasks/b1k.py``) supplies the description by task name. Raises if a
+    description is missing for any of ``required_task_indices`` (default: every task of the dataset).
+    """
+    if prompt_source not in PROMPT_SOURCES:
+        raise ValueError(f"Unknown prompt_source {prompt_source!r}; choose from {list(PROMPT_SOURCES)}")
+    names = task_names_by_index(meta.tasks)
+    if prompt_source == "task_name":
+        return names
+    descriptions = load_task_descriptions(meta.root, names) or {}
+    registry = TASK_REGISTRY.get(TASK_REGISTRY_BUCKET, {})
+    for task_index, name in names.items():
+        if task_index not in descriptions and name in registry:
+            descriptions[task_index] = registry[name]
+    required = set(names) if required_task_indices is None else {int(i) for i in required_task_indices}
+    if missing := sorted(required - set(descriptions)):
+        raise ValueError(
+            f"No task description for task_index {missing[:10]} ({[names.get(i, '?') for i in missing[:10]]}): "
+            f"neither {pathlib.Path(meta.root) / 'meta' / TASKS_JSONL_FILENAME} nor openpi's task registry "
+            f"(src/openpi/configs/tasks/{TASK_REGISTRY_BUCKET}.py) has one. Download meta/tasks.jsonl or use "
+            "--data.prompt-source task_name."
+        )
+    return {task_index: descriptions[task_index] for task_index in names if task_index in descriptions}
+
+
+def check_prompt_token_lengths(prompts: dict[int, str], model_config: Any) -> None:
+    """Fail fast if a prompt cannot fit ``model_config.max_token_len`` (PaliGemma-tokenized pi0 / pi05 models).
+
+    ``PaligemmaTokenizer`` truncates over-long prompts from the end -- for pi05, whose prompt is
+    ``Task: <text>, State: <discretized state>;\\nAction:``, that drops state digits and the ``Action:`` marker, so
+    the policy would silently lose its proprioception on those tasks. The challenge demos' task descriptions run
+    up to ~105 tokens, which next to a 32-dim state does not always fit the default ``max_token_len=200``. The
+    state is assumed worst case (every dimension a 3-digit bin).
+    """
+    model_type = getattr(model_config, "model_type", None)
+    if model_type is None or model_type.value not in ("pi0", "pi05"):
+        return
+    from openpi.models import tokenizer as _tokenizer  # local import: fetches the tokenizer model on first use
+
+    max_len = int(model_config.max_token_len)
+    tokenizer = _tokenizer.PaligemmaTokenizer(max_len=max(8 * max_len, 4096))  # long enough to never truncate
+    state = np.full(int(model_config.action_dim), 1.0) if getattr(model_config, "discrete_state_input", False) else None
+    too_long: dict[int, tuple[str, int]] = {}
+    for task_index, prompt in prompts.items():
+        length = int(tokenizer.tokenize(prompt, state=state)[1].sum())
+        if length > max_len:
+            too_long[task_index] = (prompt, length)
+    if too_long:
+        needed = max(length for _, length in too_long.values())
+        shown = "; ".join(
+            f"task_index {i}: {length} tokens ({p[:60]!r}...)" for i, (p, length) in list(too_long.items())[:5]
+        )
+        raise ValueError(
+            f"{len(too_long)} task prompt(s) exceed max_token_len={max_len}"
+            f"{' together with the discretized state' if state is not None else ''} and would be truncated: {shown}. "
+            f"Pass --model.max-token-len {needed} (or more), or prompt with --data.prompt-source task_name."
+        )
+
+
+def save_prompt_source(assets_dir: Any, prompt_source: str) -> None:
+    """Record ``prompt_source`` in a checkpoint's assets directory (next to ``norm_stats.json``)."""
+    if prompt_source not in PROMPT_SOURCES:
+        raise ValueError(f"Unknown prompt_source {prompt_source!r}; choose from {list(PROMPT_SOURCES)}")
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    (assets_dir / PROMPT_SOURCE_FILENAME).write_text(json.dumps({"prompt_source": prompt_source}))
+
+
+def load_prompt_source(assets_dir: str | pathlib.Path) -> str | None:
+    """The ``prompt_source`` a checkpoint was trained with, or None for checkpoints that predate the record."""
+    path = pathlib.Path(assets_dir) / PROMPT_SOURCE_FILENAME
+    if not path.is_file():
+        return None
+    prompt_source = json.loads(path.read_text())["prompt_source"]
+    if prompt_source not in PROMPT_SOURCES:
+        raise ValueError(f"{path} holds unknown prompt_source {prompt_source!r}; choose from {list(PROMPT_SOURCES)}")
+    return prompt_source
 
 
 def _column(table: Any, name: str) -> list:

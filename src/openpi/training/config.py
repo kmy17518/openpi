@@ -114,6 +114,11 @@ class DataConfig:
     # "turning_on_radio"). None: every task on disk. Works the same on the full 100-task root and on a per-task
     # partial download; norm stats of a subset are kept under their own asset id (`<repo_id>/task_subsets/<key>`).
     task_names: Sequence[str] | None = None
+    # Which text of a task the policy is prompted with when `prompt_from_task` is set: "task_name" -- the LeRobot task
+    # string of `meta/tasks.parquet` (the snake_case id for the challenge demos, e.g. "turning_on_radio"; stock
+    # behavior), or "task_description" -- the natural-language instruction from the dataset's `meta/tasks.jsonl`
+    # (fallback: `configs/tasks/b1k.py`). Recorded in the checkpoint assets so serve_b1k.py prompts the same way.
+    prompt_source: _b1k_dataset.PromptSource = _b1k_dataset.DEFAULT_PROMPT_SOURCE
 
 
 class GroupFactory(Protocol):
@@ -393,6 +398,12 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # none of the selected tasks (a partial download of other tasks), fail fast. Overrides `base_config.task_names`.
     # CLI: --data.task-names TASK [TASK ...]
     task_names: Sequence[str] | None = None
+    # Text the policy is prompted with: `task_name` (the snake_case task id from `meta/tasks.parquet`, e.g.
+    # `turning_on_radio`) or `task_description` (the natural-language instruction, e.g. "Turn on the radio receiver
+    # that's on the table in the living room.", from the dataset's `meta/tasks.jsonl`). The choice is saved in the
+    # checkpoint so `serve_b1k.py` prompts with the same kind of text. Overrides `base_config.prompt_source`.
+    # CLI: --data.prompt-source task_description
+    prompt_source: _b1k_dataset.PromptSource | None = None
 
     @override
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -402,6 +413,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         task_names = _b1k_dataset.normalize_task_names(
             self.task_names if self.task_names is not None else base_config.task_names
         )
+        prompt_source = self.prompt_source if self.prompt_source is not None else base_config.prompt_source
         asset_id = self.assets.asset_id
         if asset_id is None and repo_id is not None:
             # A task subset has its own norm stats: `<repo_id>/task_subsets/<key>` (`<repo_id>` for the whole dataset).
@@ -412,6 +424,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             asset_id=asset_id,
             dataset_root=dataset_root,
             task_names=task_names,
+            prompt_source=prompt_source,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
