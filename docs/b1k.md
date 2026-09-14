@@ -245,6 +245,7 @@ outputs/checkpoints/<CONFIG_NAME>/<EXP_NAME>/<STEP>/
 | Flag | Purpose |
 |------|---------|
 | `--batch_size` | Per-step batch size (must divide evenly across GPUs) |
+| `--num_workers` | Data-loader worker processes (default 8; see [Batch size and data-loader settings](#batch-size-and-data-loader-settings-for-4-gpus)) |
 | `--num_train_steps` | Total optimization steps |
 | `--data.repo_id` | Override dataset repo ID (asset id of the norm stats) |
 | `--data.dataset-root` | Override local dataset path |
@@ -351,6 +352,42 @@ Verified on a 4× B300 aarch64 host with the single-task `chop_an_onion` downloa
 | `CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 uv run scripts/b1k/serve_b1k.py --robot b1k/R1Pro --task b1k/<TASK_NAME> --repo-id <REPO_ID> --policy.config pi05_b1k --policy.dir <CHECKPOINT_DIR> --control_mode receding_horizon --action_horizon 16 --port 8000` | serves; first request ~5 s (JIT), then ~30 ms per step averaged over the receding horizon |
 
 Known limits: `scripts/train.py` and `scripts/serve_policy.py` (the non-B1K entry points) do not call `configure_xla_flags()` — export `XLA_FLAGS=--xla_gpu_enable_triton_gemm=false` yourself or add the call. `torch.compile` and the PyTorch training path (`scripts/train_pytorch.py`) were not exercised; the bundled triton 3.3.1 does not target compute capability 10.3 either. The `Unknown compute capability 10.3` warning itself keeps being printed by XLA once per compiled kernel and is harmless.
+
+#### Batch size and data-loader settings for 4 GPUs
+
+Measured on the same 4× B300 node with data-parallel training (`fsdp_devices=1`, one model replica per GPU, `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` = 249 GiB usable per GPU). The train step was timed on a fixed batch, so these are pure GPU numbers:
+
+| Global batch (per GPU) | s/step | samples/s | peak GPU memory | compile + first step |
+|-----------------------:|-------:|----------:|----------------:|---------------------:|
+| 64 (16) — the documented default | 0.42 | 154 | 67 GiB | 8 s (cached) |
+| 128 (32) | 0.70 | 183 | 71 GiB | 43 s |
+| 256 (64) | 1.32 | 194 | 82 GiB | 93 s |
+| 512 (128) | 2.56 | 200 | 105 GiB | 126 s |
+| 1024 (256) | 5.11 | 200 | 151 GiB | 179 s |
+| 2048 (512) | 10.5 | 194 | 235 GiB | 521 s |
+| 2560 (640) | — | — | out of memory | — |
+
+Params + optimizer state take 51 GiB per GPU; activations add ~0.36 GiB per sample. The largest batch that fits is **2048** (512 per GPU), but throughput saturates at ~200 samples/s from **512** on — every larger batch only buys longer compiles, more memory and fewer optimizer steps per sample. Going from the default 64 to 512 gives +30 % samples/s; the LR schedule (`CosineDecaySchedule`, tuned for batch 64) and `num_train_steps` are not adjusted automatically, so scale them when you change the batch.
+
+The data loader has to deliver those ~200 samples/s. Three changes to the B1K pipeline cut its CPU cost per sample roughly in half (all default now, each overridable through `dataset_kwargs`): only the three RGB camera streams of the robot config are decoded (`video_keys`; the depth streams were decoded and thrown away), frames are handed over as uint8 instead of lerobot's float32 (`return_uint8=True`; the float round trip also truncated some pixel values by one), and images are made contiguous before the PIL resize in `B1KInputs`. Loader throughput on this node (standalone, batch 256):
+
+| `--num_workers` | before | after | worker start-up |
+|-----------------|-------:|------:|----------------:|
+| 8 (default) | 151 samples/s | 252 samples/s | ~45 s |
+| 16 | 280 | 478 | ~80 s |
+| 32 | 368 | 790 | 3–5 min |
+
+`OMP_NUM_THREADS` (1, 8 or unset) made no measurable difference to either number: the workers run torch with one thread anyway and the decoding threads are FFmpeg's own. Setting it to 1 merely trims ~125 idle OpenMP threads per worker process.
+
+Recommended 4-GPU command (verified: 2.5–2.7 s/step, i.e. the GPU-bound rate, with both 8 and 16 workers; 16 leaves ~2× headroom):
+
+```bash
+./scripts/b1k/train_b1k.sh pi05_b1k 4 0,1,2,3 \
+    --batch_size=512 --num_workers=16 \
+    --data.repo_id=<REPO_ID> --data.dataset-root=<DATASET_ROOT>
+```
+
+(`train_b1k.sh` passes its own `--batch_size=64` first; the later `--batch_size=512` wins.)
 
 ---
 

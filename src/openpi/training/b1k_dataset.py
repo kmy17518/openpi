@@ -404,14 +404,21 @@ class _B1KDatasetReader(DatasetReader):
     """``DatasetReader`` over an explicit list of data files, with lengths and frame-index mapping derived
     from the rows actually loaded instead of the dataset-wide totals in ``meta/info.json``."""
 
-    def __init__(self, *args, data_files: Sequence[pathlib.Path], **kwargs):
+    def __init__(self, *args, data_files: Sequence[pathlib.Path], video_keys: Iterable[str] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._data_files = [str(path) for path in data_files]
+        # Video streams to decode; None = every stream in the dataset (lerobot's behavior). Requested keys that are
+        # not video streams (e.g. image columns stored in the parquet files) need no decoding and are ignored here.
+        self._video_keys: frozenset[str] | None = None
+        if video_keys is not None:
+            self._video_keys = frozenset(video_keys) & set(self._meta.video_keys)
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
         if self._video_backend == "pyav" and quiet_pyav_logging():
             # Once per process (data-loader workers included): see quiet_pyav_logging.
             logging.info("Disabled PyAV's Python log forwarding for the pyav video backend")
+        if self._video_keys is not None:
+            query_timestamps = {key: ts for key, ts in query_timestamps.items() if key in self._video_keys}
         return super()._query_videos(query_timestamps, ep_idx)
 
     def _load_hf_dataset(self) -> datasets.Dataset:
@@ -524,7 +531,10 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
 
     Accepts the ``LeRobotDataset`` read-mode constructor arguments used by openpi (``repo_id``, ``root``,
     ``episodes``, ``delta_timestamps``, ``tolerance_s``, ``video_backend``, ``image_transforms``,
-    ``return_uint8``); items are produced by lerobot's ``DatasetReader`` exactly as ``LeRobotDataset`` does.
+    ``return_uint8``); items are produced by lerobot's ``DatasetReader`` exactly as ``LeRobotDataset`` does, except
+    that ``video_keys`` restricts which video streams are decoded (default: all of them). The challenge demos carry
+    six streams per frame (RGB and depth for three cameras) and the R1Pro policy consumes the three RGB ones, so
+    decoding only those halves the per-sample cost of the data loader.
     """
 
     def __init__(
@@ -539,6 +549,7 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         video_backend: str | None = None,
         image_transforms: Any = None,
         return_uint8: bool = False,
+        video_keys: Iterable[str] | None = None,
     ):
         super().__init__()
         self.repo_id = repo_id
@@ -576,17 +587,27 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
             return_uint8=return_uint8,
             data_files=[self.root / path for path in data_files],
+            video_keys=video_keys,
         )
         self.reader.load_and_activate()
         logging.info(
-            "B1KLeRobotDataset(%s): %d episodes, %d frames, %d data files under %s%s",
+            "B1KLeRobotDataset(%s): %d episodes, %d frames, %d data files under %s%s; decoding %s",
             repo_id,
             self.num_episodes,
             self.num_frames,
             len(data_files),
             self.root,
             f" (task subset {list(self.task_names)})" if self.task_names else "",
+            f"{len(self.video_keys)} of {len(self.meta.video_keys)} video streams: {sorted(self.video_keys)}"
+            if video_keys is not None
+            else f"all {len(self.meta.video_keys)} video streams",
         )
+
+    @property
+    def video_keys(self) -> list[str]:
+        """Video streams decoded per item (all of the dataset's unless ``video_keys`` restricted them)."""
+        keys = self.reader._video_keys  # noqa: SLF001
+        return list(self.meta.video_keys) if keys is None else [k for k in self.meta.video_keys if k in keys]
 
     @property
     def fps(self) -> int:

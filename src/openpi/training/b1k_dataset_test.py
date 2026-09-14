@@ -234,6 +234,29 @@ def test_dataset_pickles_for_dataloader_workers(partial_root: pathlib.Path):
     assert torch.equal(clone[7]["observation.state"], ds[7]["observation.state"])
 
 
+def test_dataset_decodes_only_requested_video_keys(full_root: pathlib.Path, monkeypatch):
+    seen: list[list[str]] = []
+
+    def fake_query_videos(self, query_timestamps, ep_idx):  # lerobot's signature
+        seen.append(sorted(query_timestamps))
+        return {key: torch.zeros(3, 2, 2) for key in query_timestamps}
+
+    monkeypatch.setattr(b1k_dataset.DatasetReader, "_query_videos", fake_query_videos)
+    ds = b1k_dataset.B1KLeRobotDataset("org/demos", full_root, video_keys=["observation.rgb.head", "not.a.video"])
+    # The synthetic root has no video streams: requested keys that are not video streams are ignored, not an error.
+    assert ds.video_keys == []
+    reader = ds.reader
+    # Pretend the dataset had three streams and only one of them was requested.
+    reader._video_keys = frozenset({"observation.rgb.head"})  # noqa: SLF001
+    timestamps = {"observation.rgb.head": [0.0], "observation.rgb.wrist": [0.0], "observation.depth.head": [0.0]}
+    assert set(reader._query_videos(timestamps, ep_idx=0)) == {"observation.rgb.head"}  # noqa: SLF001
+    assert seen[-1] == ["observation.rgb.head"]
+    # No restriction: everything lerobot asks for is decoded.
+    reader._video_keys = None  # noqa: SLF001
+    assert set(reader._query_videos(timestamps, ep_idx=0)) == set(timestamps)  # noqa: SLF001
+    assert seen[-1] == sorted(timestamps)
+
+
 DESCRIPTIONS = {
     "turning_on_radio": "Turn on the radio receiver that's on the table in the living room.",
     "picking_up_trash": "Put the three cans of soda from the living room inside the trash can in the kitchen.",
