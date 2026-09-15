@@ -430,12 +430,19 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         )
 
     def _build_delta_mappings(self, robot_config) -> list[tuple[list[int], list[int]]]:
+        """(action_indices, state_indices) pairs for `MappedDeltaActions` / `MappedAbsoluteActions`.
+
+        `state_indices` index the state vector that `B1KInputs` extracts from the proprio groups (concatenated in
+        order, each `is_eef` group reduced to a single dim). Delta action groups with `delta_state_indices` use them
+        as given; the others are matched, in order, to the next not-yet-used proprio slice of the same size.
+        """
         state_slices = []
         state_offset = 0
         for proprio_config in robot_config.proprio:
             dim = 1 if proprio_config.is_eef else len(proprio_config.indices)
             state_slices.append(list(range(state_offset, state_offset + dim)))
             state_offset += dim
+        state_dim = state_offset
 
         mappings = []
         state_slice_index = 0
@@ -443,6 +450,20 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             if action_config.is_eef or not action_config.needs_delta_comp:
                 continue
             action_dim = len(action_config.indices)
+            if action_config.delta_state_indices is not None:
+                state_indices = list(action_config.delta_state_indices)
+                if len(state_indices) != action_dim:
+                    raise ValueError(
+                        f"Delta action group {action_config.name!r} has {action_dim} action indices but "
+                        f"{len(state_indices)} delta_state_indices in robot config {robot_config.robot_type!r}."
+                    )
+                if any(not 0 <= i < state_dim for i in state_indices):
+                    raise ValueError(
+                        f"Delta action group {action_config.name!r}: delta_state_indices {state_indices} out of range "
+                        f"for the {state_dim}-dim extracted state of robot config {robot_config.robot_type!r}."
+                    )
+                mappings.append((list(action_config.indices), state_indices))
+                continue
             while state_slice_index < len(state_slices) and len(state_slices[state_slice_index]) != action_dim:
                 state_slice_index += 1
             if state_slice_index >= len(state_slices):

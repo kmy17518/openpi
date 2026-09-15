@@ -101,6 +101,7 @@ The R1Pro robot used in BEHAVIOR-1K is already registered in `src/openpi/configs
 - **Cameras:** head (`zed_link`), left wrist, and right wrist RGB streams
 - **Action space (23-D):** base velocity, torso joints, dual arms, and grippers
 - **Proprioception:** extracted from `observation.state` using the indices in the robot config
+- **Delta actions:** groups with `needs_delta_comp=True` (torso joints 1–3, both arms) are trained as offsets from the matching proprio state and turned back into absolute commands at serving time. Torso joint 4 (`action[6]`) is kept absolute: it is never commanded in the challenge demos (identically 0), while its measured position occasionally yields under load, so a delta target would be ≈0 with rare outliers far outside its q01/q99 normalization range. A group whose state slice cannot be found by size names it explicitly with `delta_state_indices` (indices into the extracted state vector).
 
 If you use a different robot or camera layout, copy this file and update `observations`, `action`, and `proprio` to match your dataset keys in `meta/info.json`.
 
