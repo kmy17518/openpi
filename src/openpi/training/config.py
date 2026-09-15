@@ -869,7 +869,14 @@ _CONFIGS = [
                 data_cls=_b1k_dataset.B1KLeRobotDataset,
                 dataset_root="/viscam/u/shiyuc/openpi/2026-challenge-demos/b1k/turning_on_radio",
                 prompt_from_task=True,
-                dataset_kwargs={"tolerance_s": 5e-4},
+                # Frames are looked up by their absolute timestamp inside the per-file mp4s, and lerobot compares those
+                # timestamps in float32. The challenge demos pack many episodes per file -- the wrist-camera files run
+                # to ~28,000 s, where float32 resolves only ~2 ms -- so a query and the matching frame's pts can round
+                # to float32 values up to ~2 ms apart. With the stock 5e-4 the trainer died mid-run on frames past
+                # ~8,200 s (about 10% of the episodes) with `FrameTimestampError ... 0.0010 > tolerance_s=0.0005`.
+                # 8 ms is 4x that worst case and a quarter of a frame at 30 fps: a frame that is genuinely off by one
+                # (33 ms) is still rejected.
+                dataset_kwargs={"tolerance_s": 8e-3},
             ),
             robot_config_name="b1k/R1Pro",
         ),

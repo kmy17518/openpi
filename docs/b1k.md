@@ -141,7 +141,7 @@ TrainConfig(
             data_cls=_b1k_dataset.B1KLeRobotDataset,
             dataset_root="<DATASET_ROOT>",
             prompt_from_task=True,
-            dataset_kwargs={"tolerance_s": 5e-4},
+            dataset_kwargs={"tolerance_s": 8e-3},
         ),
         robot_config_name="b1k/R1Pro",
     ),
@@ -170,6 +170,7 @@ Key implementation details:
 - **`dataset_root`** is required for B1K datasets; the generic `scripts/train.py` path does not set this automatically. `--data.dataset-root` / `--data.task-names` on the command line override the config's `dataset_root` / `task_names`.
 - **`B1KLeRobotDataset`** (`src/openpi/training/b1k_dataset.py`) reads local roots only — never the Hub — and handles per-task partial downloads, whose episode indices do not start at 0.
 - **`action_horizon=32`** matches the π₀.₅ B1K setup; keep training and inference horizons consistent.
+- **`tolerance_s=8e-3`**: lerobot looks video frames up by their absolute timestamp inside the per-file mp4s and compares in float32. The challenge demos pack many episodes per file (the wrist-camera files run to ~28,000 s, where float32 resolves ~2 ms), so with the stock `5e-4` the trainer crashed mid-run with `FrameTimestampError` on frames past ~8,200 s. 8 ms is a quarter of a frame at 30 fps, so a frame that is genuinely off by one is still rejected.
 
 You can override most fields from the command line when launching training (see below).
 
