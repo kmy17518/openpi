@@ -38,6 +38,12 @@ class StateActionConfig:
     indices: Optional[List[int]] = None # Indices in the full action/proprio array
     is_eef: bool = False                # Whether this corresponds to an end-effector command (gripper, dexhand, etc.)
     needs_delta_comp: bool = False      # [Action Only] Whether to compute delta from previous step
+    # [Action Only, with needs_delta_comp] Indices into the *extracted* state vector (the proprio groups concatenated
+    # in order, each `is_eef` group reduced to one dim -- see `extract_state_from_proprio`) that this group's deltas
+    # are taken relative to; same length as `indices`. None: use the first not-yet-matched proprio group of the same
+    # size, in order. Set it when that size-based matching would be ambiguous or wrong, e.g. for a group that spans
+    # only part of a proprio group.
+    delta_state_indices: Optional[List[int]] = None
 
 
 @dataclass
@@ -81,3 +87,16 @@ class RobotConfig:
                 f"action_dim ({self.action_dim})"
             )
 
+        # Validate explicit delta-state mappings
+        for a in self.action:
+            if a.delta_state_indices is None:
+                continue
+            if not a.needs_delta_comp:
+                raise ValueError(
+                    f"Action group {a.name!r} sets delta_state_indices but not needs_delta_comp"
+                )
+            if len(a.delta_state_indices) != len(a.indices):
+                raise ValueError(
+                    f"Action group {a.name!r}: delta_state_indices has {len(a.delta_state_indices)} "
+                    f"entries but the group has {len(a.indices)} action indices"
+                )
