@@ -36,6 +36,20 @@ def test_checkpoint_schedule_and_stage(tmp_path):
         observer.on_step(26, {"loss": float("nan")}, 1.0)
 
 
+def test_resume_reconciles_unstaged_completed_saves(tmp_path):
+    settings = {
+        "status_file": str(tmp_path / "status.json"),
+        "staging_dir": str(tmp_path / "staging"),
+        "first_checkpoint_step": 25,
+        "max_steps": 300000,
+        "save_interval": 2500,
+    }
+    stage = Mock()
+    observer = RunObserver(settings, stage)
+    observer.reconcile_checkpoints(tmp_path, [300000, 10000, 25])
+    assert [call.args[2] for call in stage.call_args_list] == [25, 10000, 300000]
+
+
 def test_stage_failure_keeps_visible_status(tmp_path):
     settings = {
         "status_file": str(tmp_path / "status.json"),

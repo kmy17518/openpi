@@ -69,6 +69,11 @@ class RunObserver:
         self.stage(path, Path(self.settings["staging_dir"]), step)
         self.update("training", staged_step=step)
 
+    def reconcile_checkpoints(self, root: Path, steps) -> None:
+        for step in sorted(steps):
+            if self.should_save(step):
+                self.on_checkpoint(root / str(step), step)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()

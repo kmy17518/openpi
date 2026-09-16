@@ -1,6 +1,7 @@
 """Keep a single-GPU trainer and its sole checkpoint publisher in one process lifetime."""
 
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -15,17 +16,24 @@ from scripts.b1k.train_b1k_monitored import atomic_json
 from scripts.b1k.train_b1k_monitored import parse_cpus
 
 
-def stop(process) -> None:
-    if process.poll() is not None:
-        return
+def stop(process, timeout: float = 30) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
     except ProcessLookupError:
-        pass
+        process.wait()
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            process.wait()
+            return
+        time.sleep(0.1)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
 
 
 def command_lines(settings: dict, config_path: Path):
@@ -57,6 +65,10 @@ def command_lines(settings: dict, config_path: Path):
         str(settings["first_checkpoint_step"]),
         "--storage-proof",
         settings["storage_proof"],
+        "--max-staging-bytes",
+        str(settings.get("max_staging_bytes", 250 * 1024**3)),
+        "--max-remote-lfs-bytes",
+        str(settings.get("max_remote_lfs_bytes", 600 * 1024**3)),
         "--sole-writer",
         "--poll-seconds",
         "30",
@@ -113,16 +125,25 @@ def main() -> int:
             Path(settings["uploader_log"]).open("a") as upload_log,
             Path(settings["training_log"]).open("a") as train_log,
         ):
-            initialized = subprocess.run(
+            initialized = subprocess.Popen(
                 [*publisher_cmd, "--init-only"],
                 env=env,
                 stdout=upload_log,
                 stderr=subprocess.STDOUT,
-                timeout=180,
-                check=False,
+                start_new_session=True,
             )
+            processes.append(initialized)
+            initialization_deadline = time.monotonic() + settings.get("initialization_timeout_seconds", 7200)
+            while initialized.poll() is None:
+                if stopped:
+                    raise RuntimeError("Cancelled during checkpoint recovery")
+                if time.monotonic() > initialization_deadline:
+                    raise RuntimeError("Checkpoint initialization/recovery exceeded its time budget")
+                atomic_json(status_path, {"state": "initializing", "pid": os.getpid(), "updated_at": time.time()})
+                time.sleep(5)
             if initialized.returncode:
                 raise RuntimeError("Publisher ownership/storage initialization failed; trainer not started")
+            processes.remove(initialized)
             uploader = subprocess.Popen(
                 publisher_cmd, env=env, stdout=upload_log, stderr=subprocess.STDOUT, start_new_session=True
             )
