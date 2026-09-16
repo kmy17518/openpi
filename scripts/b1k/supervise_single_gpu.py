@@ -174,9 +174,9 @@ def main() -> int:
                     atomic_json(status_path, {"state": "completed", "updated_at": time.time()})
                     return 0
                 if ucode == 0 and tcode is None:
-                    status = json.loads(Path(settings["status_file"]).read_text())
-                    if status.get("step", 0) < settings["max_steps"]:
-                        raise RuntimeError("Publisher exited before the final training step")
+                    status = json.loads((Path(settings["staging_dir"]) / "status.json").read_text())
+                    if not status.get("done") or status.get("latest_full_step") != settings["max_steps"]:
+                        raise RuntimeError("Publisher exited before verifying the final checkpoint")
                 if tcode == 0:
                     trainer_finished = trainer_finished or time.monotonic()
                     if time.monotonic() - trainer_finished > 7200:

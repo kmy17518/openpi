@@ -492,6 +492,7 @@ def main(config: _config.TrainConfig, *, observer=None):
         if resuming:
             train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
             if observer is not None:
+                observer.update("resuming", step=int(train_state.step))
                 observer.reconcile_checkpoints(config.checkpoint_dir, checkpoint_manager.all_steps())
 
         if config.prefetch_batches > 0:
