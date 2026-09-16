@@ -1,3 +1,5 @@
+import dataclasses
+
 from .base_config import ObservationConfig, StateActionConfig, RobotConfig, register_robot
 
 
@@ -59,3 +61,16 @@ R1Pro = RobotConfig(
 
 # Register robots in the global registry
 register_robot("b1k/R1Pro", R1Pro)
+
+# Compatibility for checkpoints trained before torso joint 4 became an absolute target.
+register_robot(
+    "b1k/R1Pro-legacy-torso-delta",
+    dataclasses.replace(
+        R1Pro,
+        action=[
+            R1Pro.action[0],
+            StateActionConfig(name="torso", indices=list(range(3, 7)), needs_delta_comp=True),
+            *R1Pro.action[3:],
+        ],
+    ),
+)

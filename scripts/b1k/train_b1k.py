@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -107,8 +108,9 @@ def _create_validation_data_loader(
             return self._data_config
 
         def __iter__(self):
-            for batch in self._torch_data_loader:
-                yield _model.Observation.from_dict(batch), batch["actions"]
+            with contextlib.closing(iter(self._torch_data_loader)) as data_iter:
+                for batch in data_iter:
+                    yield _model.Observation.from_dict(batch), batch["actions"]
 
     val_dataset = _data_loader.create_b1k_dataset(actual_val_data_config, val_config.model.action_horizon)
     logging.info(f"Validation dataset created for {actual_val_data_config.repo_id}")
@@ -164,25 +166,25 @@ def _compute_validation_losses(
         out_shardings=replicated_sharding,
     )
 
-    val_iter = iter(val_loader)
     losses = []
     # Use a separate RNG for validation to avoid interference with training RNG,
     # the specific seed offset is arbitrary.
     val_rng = jax.random.key(config.seed + 1000)
 
-    for batch_idx in range(config.val_num_batches):
-        try:
-            batch = next(val_iter)
-        except StopIteration:
-            break
+    with contextlib.closing(iter(val_loader)) as val_iter:
+        for batch_idx in range(config.val_num_batches):
+            try:
+                batch = next(val_iter)
+            except StopIteration:
+                break
 
-        try:
-            with sharding.set_mesh(mesh):
-                loss = pvalidation_step(train_state, batch, val_rng)
-            losses.append(jax.device_get(loss))
-        except (RuntimeError, ValueError) as e:
-            logging.warning("Error computing validation loss for batch %d: %s", batch_idx, e)
-            continue
+            try:
+                with sharding.set_mesh(mesh):
+                    loss = pvalidation_step(train_state, batch, val_rng)
+                losses.append(jax.device_get(loss))
+            except (RuntimeError, ValueError) as e:
+                logging.warning("Error computing validation loss for batch %d: %s", batch_idx, e)
+                continue
 
     if not losses:
         return None
@@ -467,74 +469,76 @@ def main(config: _config.TrainConfig):
         skip_norm_stats=False
     )
     data_iter = iter(data_loader)
-    batch = next(data_iter)
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
-
-    # Log images from first batch to sanity check. Images are [B, h, w, c] or, with gradient accumulation,
-    # [grad_accum_steps, B / grad_accum_steps, h, w, c]; index the i-th sample of either layout.
-    def sample_image(img, i):
-        return img[i] if img.ndim == 4 else img[i // img.shape[1], i % img.shape[1]]
-
-    num_samples = int(np.prod(next(iter(batch[0].images.values())).shape[:-3]))
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(sample_image(img, i)) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, num_samples))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
-
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
-
-    if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-
-    if config.prefetch_batches > 0:
-        # From here on the batches are pulled in a background thread (the torch loader's worker processes were started
-        # above, in the main thread, by the first `next`), so the hand-off overlaps with the running train step.
-        data_iter = _data_loader.PrefetchIterator(data_iter, depth=config.prefetch_batches)
-
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, batch_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
-
-    start_step = int(train_state.step)
-    pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
-        initial=start_step,
-        total=config.num_train_steps,
-        dynamic_ncols=True,
-    )
-
-    infos = []
-    for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        if config.val_log_interval and step % config.val_log_interval == 0:
-            val_loss = compute_validation_loss(
-                config, train_state, mesh, train_state_sharding, replicated_sharding, data_loader
-            )
-            if val_loss is not None:
-                wandb.log({"val_loss": val_loss}, step=step)
-                logging.info("Validation loss at step %d: %.4f", step, val_loss)
+    try:
         batch = next(data_iter)
+        logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        # Images are [B, h, w, c] or [grad_accum_steps, B / grad_accum_steps, h, w, c].
+        def sample_image(img, i):
+            return img[i] if img.ndim == 4 else img[i // img.shape[1], i % img.shape[1]]
 
-    logging.info("Waiting for checkpoint manager to finish")
-    checkpoint_manager.wait_until_finished()
+        num_samples = int(np.prod(next(iter(batch[0].images.values())).shape[:-3]))
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(sample_image(img, i)) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, num_samples))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
+
+        train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+        jax.block_until_ready(train_state)
+        logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+
+        if resuming:
+            train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+        if config.prefetch_batches > 0:
+            # Workers start on the main thread above; only the prefetch producer owns upstream from here on.
+            data_iter = _data_loader.PrefetchIterator(data_iter, depth=config.prefetch_batches)
+
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, batch_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
+
+        start_step = int(train_state.step)
+        with tqdm.tqdm(
+            range(start_step, config.num_train_steps),
+            initial=start_step,
+            total=config.num_train_steps,
+            dynamic_ncols=True,
+        ) as pbar:
+            infos = []
+            for step in pbar:
+                with sharding.set_mesh(mesh):
+                    train_state, info = ptrain_step(train_rng, train_state, batch)
+                infos.append(info)
+                if step % config.log_interval == 0:
+                    stacked_infos = common_utils.stack_forest(infos)
+                    reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                    info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                    pbar.write(f"Step {step}: {info_str}")
+                    wandb.log(reduced_info, step=step)
+                    infos = []
+                if config.val_log_interval and step % config.val_log_interval == 0:
+                    val_loss = compute_validation_loss(
+                        config, train_state, mesh, train_state_sharding, replicated_sharding, data_loader
+                    )
+                    if val_loss is not None:
+                        wandb.log({"val_loss": val_loss}, step=step)
+                        logging.info("Validation loss at step %d: %.4f", step, val_loss)
+                batch = next(data_iter)
+
+                if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                    _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+
+        logging.info("Waiting for checkpoint manager to finish")
+        checkpoint_manager.wait_until_finished()
+    finally:
+        close = getattr(data_iter, "close", None)
+        if close is not None:
+            close()
 
 
 if __name__ == "__main__":

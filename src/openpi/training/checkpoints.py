@@ -4,7 +4,7 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
-from typing import List, Protocol
+from typing import Protocol
 
 from etils import epath
 import jax
@@ -13,6 +13,7 @@ import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
+import openpi.training.b1k_artifacts as _b1k_artifacts
 import openpi.training.b1k_dataset as _b1k_dataset
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
@@ -85,6 +86,10 @@ def save_state(
             # openpi.training.b1k_dataset) so that serving prompts with the same kind of text.
             if data_config.prompt_from_task:
                 _b1k_dataset.save_prompt_source(directory / asset_id, data_config.prompt_source)
+            if data_config.action_representation is not None:
+                if data_config.inference_metadata is None:
+                    raise ValueError("BEHAVIOR data loader is missing resolved inference metadata")
+                _b1k_artifacts.save_metadata(directory / asset_id, data_config.inference_metadata)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
@@ -103,7 +108,22 @@ def restore_state(
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
 ) -> training_utils.TrainState:
-    del data_loader
+    data_config = data_loader.data_config()
+    if data_config.action_representation is not None:
+        restore_step = checkpoint_manager.latest_step() if step is None else step
+        assets_dir = checkpoint_manager.directory / str(restore_step) / "assets" / data_config.asset_id
+        metadata = _b1k_artifacts.load_metadata(assets_dir)
+        _b1k_artifacts.validate_representation(
+            metadata,
+            data_config.action_representation,
+            allow_legacy_assets=data_config.allow_legacy_assets,
+            context="Resume checkpoint",
+        )
+        if metadata is not None and data_config.inference_metadata is not None:
+            for key in ("task_prompts", "prompt_source", "model_type", "model"):
+                if metadata.get(key) != data_config.inference_metadata.get(key):
+                    raise ValueError(f"Resume checkpoint {key} differs from the current training configuration")
+        _b1k_artifacts.validate_norm_stats(_normalize.load(assets_dir), data_config.norm_stats)
 
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
@@ -118,7 +138,7 @@ def restore_state(
     return _merge_params(restored["train_state"], restored["params"])
 
 
-def load_norm_stats(assets_dir: epath.Path | str, asset_id: str | List[str]) -> dict[str, _normalize.NormStats] | None:
+def load_norm_stats(assets_dir: epath.Path | str, asset_id: str | list[str]) -> dict[str, _normalize.NormStats] | None:
     if isinstance(asset_id, list):
         # Only load the first asset_id assuming that the datasets are similar
         asset_id = asset_id[0]

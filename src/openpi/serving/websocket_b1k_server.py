@@ -1,12 +1,11 @@
 import asyncio
 import copy
-from copy import deepcopy
 import functools
 import http
 import logging
 import time
 import traceback
-from typing import Any, Optional
+from typing import Any
 
 import msgpack
 import numpy as np
@@ -24,10 +23,7 @@ ACTION_CHUNK_REQUEST_KEY = "__action_chunk_size__"
 
 
 class WebsocketPolicyServer:
-    """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
-
-    Currently only implements the `load` and `infer` methods.
-    """
+    """Serve fixed execution chunks, with one fresh prediction per observation request."""
 
     def __init__(
         self,
@@ -39,7 +35,8 @@ class WebsocketPolicyServer:
         self._policy = policy
         self._host = host
         self._port = port
-        self._metadata = metadata or {}
+        self._validate_action_chunk_request(policy, policy.action_horizon)
+        self._metadata = dict(metadata or {})
 
     def serve_forever(self) -> None:
         asyncio.run(self.run())
@@ -63,27 +60,25 @@ class WebsocketPolicyServer:
 
     @staticmethod
     def _validate_action_chunk_request(policy, action_chunk_size: int) -> None:
-        if action_chunk_size <= 1:
-            return
         if policy.control_mode != "receding_horizon":
-            raise ValueError("Action-chunk replay is only exact for receding_horizon control")
-        if action_chunk_size > policy.action_horizon:
-            raise ValueError(
-                f"Requested action chunk {action_chunk_size} crosses the fresh-observation replanning "
-                f"boundary at {policy.action_horizon}"
-            )
-        if action_chunk_size > policy.max_len:
-            raise ValueError(
-                f"Requested action chunk {action_chunk_size} exceeds model action sequence length {policy.max_len}"
-            )
+            raise ValueError("Action chunks require receding_horizon control")
+        for name, value in (
+            ("execution_horizon", policy.action_horizon),
+            ("prediction_horizon", policy.prediction_horizon),
+            (ACTION_CHUNK_REQUEST_KEY, action_chunk_size),
+        ):
+            if isinstance(value, bool | np.bool_) or not isinstance(value, int | np.integer) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if policy.action_horizon > policy.prediction_horizon:
+            raise ValueError("execution_horizon must not exceed prediction_horizon")
+        if action_chunk_size != policy.action_horizon:
+            raise ValueError(f"Requested action chunk must equal execution_horizon={policy.action_horizon}")
 
     async def _handler(self, websocket):
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = Packer()
 
-        # Per-connection policy: shares the heavy (stateless) jax model but keeps its own
-        # receding-horizon buffers/step counter. Without this, concurrent eval env slots all share the
-        # single self._policy and corrupt each other's action plans (only slot 0 stays coherent).
+        # Model weights are shared; connection resets never reset another client's model or state.
         conn_policy = copy.copy(self._policy)
         self._clear_policy_state(conn_policy)
 
@@ -94,24 +89,23 @@ class WebsocketPolicyServer:
             try:
                 start_time = time.monotonic()
                 result = unpackb(await websocket.recv(), strict_map_key=False)
+                if not isinstance(result, dict):
+                    raise ValueError("Expected an observation dictionary")
                 if "reset" in result:
+                    if result["reset"] is not True or len(result) != 1:
+                        raise ValueError("Reset requests must be exactly {'reset': True}")
                     self._clear_policy_state(conn_policy)
                     continue
 
-                action_chunk_size = max(1, int(result.pop(ACTION_CHUNK_REQUEST_KEY, 1)))
+                action_chunk_size = result.pop(ACTION_CHUNK_REQUEST_KEY, 1)
                 self._validate_action_chunk_request(conn_policy, action_chunk_size)
-                obs = deepcopy(result)
 
                 infer_time = time.monotonic()
-                actions = [conn_policy.act(obs) for _ in range(action_chunk_size)]
+                chunk = conn_policy.act_chunk(result)
                 infer_time = time.monotonic() - infer_time
 
-                action_arrays = [action.cpu().numpy() for action in actions]
-                action = {
-                    "action": action_arrays[0],
-                }
-                if action_chunk_size > 1:
-                    action["action_chunk"] = np.stack(action_arrays, axis=-2)
+                action_chunk = chunk.cpu().numpy()
+                action = {"action": action_chunk[..., 0, :], "action_chunk": action_chunk}
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }
@@ -139,13 +133,12 @@ class WebsocketPolicyServer:
                 raise
 
 
-def _health_check(connection, request) -> Optional[Any]:
+def _health_check(connection, request) -> Any | None:
     if hasattr(request, "path") and request.path == "/healthz":
         if hasattr(connection, "respond"):
             return connection.respond(http.HTTPStatus.OK, "OK\n")
-        else:
-            # For older websockets versions, return a simple response
-            return http.HTTPStatus.OK, {"Content-Type": "text/plain"}, b"OK\n"
+        # For older websockets versions, return a simple response
+        return http.HTTPStatus.OK, {"Content-Type": "text/plain"}, b"OK\n"
     # Continue with the normal request handling.
     return None
 

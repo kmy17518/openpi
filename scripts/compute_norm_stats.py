@@ -220,12 +220,11 @@ def _create_lowdim_dataset(
     tolerance_s = dataset_kwargs.get("tolerance_s", 1e-4)
     if data_config.task_names:
         subset = _b1k_dataset.select_task_subset(
-            _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root), data_config.task_names
+            _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root),
+            data_config.task_names,
+            episodes=episodes,
         )
-        selected = set(subset.episode_indices)
-        if episodes is not None:
-            selected &= {int(episode) for episode in episodes}
-        episodes = sorted(selected)
+        episodes = list(subset.episode_indices)
     elif episodes is not None:
         episodes = sorted({int(episode) for episode in episodes})
 
@@ -392,6 +391,10 @@ def main(args: Args):
         print(f"Stats computed over task subset {list(data_config.task_names)} only")
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
+    if data_config.action_representation is not None:
+        from openpi.training import b1k_artifacts
+
+        b1k_artifacts.save_metadata(output_path, b1k_artifacts.norm_metadata(data_config.action_representation))
 
 
 if __name__ == "__main__":

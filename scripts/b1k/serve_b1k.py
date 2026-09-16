@@ -5,6 +5,7 @@ import socket
 
 import tyro
 
+from openpi.configs.robots import ROBOT_REGISTRY
 from openpi.configs.tasks import TASK_REGISTRY
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
@@ -14,6 +15,7 @@ from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper
 import openpi.shared.normalize as _normalize
 import openpi.shared.xla_gpu_compat as _xla_gpu_compat
 from openpi.training import config as _config
+import openpi.training.b1k_artifacts as _b1k_artifacts
 import openpi.training.b1k_dataset as _b1k_dataset
 
 
@@ -49,8 +51,12 @@ class Args:
     prompt_source: _b1k_dataset.PromptSource | None = None
     # Prompt the policy with exactly this text instead (overrides --prompt-source and the task registry).
     text_prompt: str | None = None
+    # Explicit budget for older checkpoints; new checkpoints restore their training value.
+    max_token_len: int | None = None
+    # Permit unversioned artifacts only after verifying their action representation matches --robot.
+    allow_legacy_assets: bool = False
     control_mode: str = "receding_horizon"
-    # Number of actions to execute before replanning.
+    # Required client chunk size n; the model predicts m=config.model.action_horizon >= n.
     action_horizon: int = 16
     # Port to serve the policy on.
     port: int = 8000
@@ -106,6 +112,12 @@ def resolve_prompt(args: Args, assets_dir: pathlib.Path) -> tuple[str, str]:
     task_bucket, task_name = args.task.split("/")
     if args.text_prompt is not None:
         return args.text_prompt, "--text-prompt"
+    metadata = _b1k_artifacts.load_metadata(assets_dir)
+    if metadata is not None and args.prompt_source is None:
+        prompts = metadata.get("task_prompts")
+        if not isinstance(prompts, dict) or task_name not in prompts or not isinstance(prompts[task_name], str):
+            raise ValueError(f"Checkpoint has no recorded prompt for {task_name!r}; pass an explicit prompt override")
+        return prompts[task_name], f"exact training prompt from {assets_dir / _b1k_artifacts.METADATA_FILENAME}"
     if args.prompt_source is not None:
         prompt_source, origin = args.prompt_source, "--prompt-source"
     elif (recorded := _b1k_dataset.load_prompt_source(assets_dir)) is not None:
@@ -133,21 +145,50 @@ def main(args: Args) -> None:
 
     # Load training config and override request-specific fields.
     config = _config.get_config(args.policy.config)
+    if args.control_mode != "receding_horizon":
+        raise ValueError("BEHAVIOR chunk serving requires --control-mode receding_horizon")
+    if isinstance(args.action_horizon, bool) or not isinstance(args.action_horizon, int):
+        raise ValueError("--action-horizon must be a positive integer")
     norm_stats_repo_id = args.repo_id or args.task
     logging.info("Using norm stats for repo: %s (task subset: %s)", norm_stats_repo_id, args.task_names)
     config = dataclasses.replace(
         config,
         data=dataclasses.replace(
-            config.data, repo_id=norm_stats_repo_id, robot_config_name=args.robot, task_names=args.task_names
+            config.data,
+            repo_id=norm_stats_repo_id,
+            robot_config_name=args.robot,
+            task_names=args.task_names,
+            allow_legacy_assets=args.allow_legacy_assets,
         ),
     )
 
     assets_dir = resolve_assets_dir(config, args.policy.dir)
+    metadata = _b1k_artifacts.load_metadata(assets_dir)
+    config = dataclasses.replace(
+        config, model=_b1k_artifacts.restore_model_config(config.model, metadata, max_token_len=args.max_token_len)
+    )
+    if not 1 <= args.action_horizon <= config.model.action_horizon:
+        raise ValueError(f"Require 1 <= --action-horizon <= prediction horizon {config.model.action_horizon}")
+    data_config = config.data.create(config.assets_dirs, config.model)
+    _b1k_artifacts.validate_representation(
+        metadata,
+        data_config.action_representation,
+        allow_legacy_assets=args.allow_legacy_assets,
+        context="Serving checkpoint",
+    )
     task_prompt, prompt_origin = resolve_prompt(args, assets_dir)
+    _b1k_dataset.check_prompt_token_lengths(
+        {0: task_prompt}, config.model, state_dim=_b1k_artifacts.state_dimension(ROBOT_REGISTRY[args.robot])
+    )
     logging.info("Using robot: %s, prompt: %r [%s]", args.robot, task_prompt, prompt_origin)
 
     policy = _policy_config.create_trained_policy(
-        config, args.policy.dir, default_prompt=task_prompt, norm_stats=_normalize.load(assets_dir)
+        config,
+        args.policy.dir,
+        default_prompt=task_prompt,
+        norm_stats=_normalize.load(assets_dir),
+        b1k_metadata=metadata,
+        max_token_len=args.max_token_len,
     )
     policy_metadata = policy.metadata
 

@@ -21,14 +21,14 @@ Every UPLOADER_POLL_SECONDS the script
 2. lists the completed orbax checkpoints under <OPENPI_DIR>/outputs/checkpoints/<CONFIG_NAME>/<EXP_NAME>/<step>/,
 3. for every step on the upload schedule -- steps <= UPLOAD_SWITCH_STEP that are multiples of UPLOAD_EVERY_UNTIL,
    later steps that are multiples of UPLOAD_EVERY_AFTER, plus the trainer's final checkpoint (NUM_TRAIN_STEPS - 1)
-   when UPLOAD_FINAL=1 -- copies ONLY what serving/eval needs into STAGING_DIR/<step>/ (`train_state/`, the
+   when UPLOAD_FINAL=1 -- copies ONLY what serving/eval needs into STAGING_DIR/<generation>/<step>-<identity>/ (`train_state/`, the
    optimizer state needed only to resume, is never copied). The copy happens as soon as the checkpoint is complete,
    so the trainer's `max_to_keep` pruning cannot take a scheduled checkpoint away before it was captured,
 4. uploads staged steps as <EXP_NAME>/checkpoint-<step>/ (creating the repo if needed) and refreshes the experiment
    and project READMEs; failures are logged and retried with backoff on later cycles -- staged copies wait on disk,
 5. logs a heartbeat (latest checkpoint, trainer alive?, last training-progress line, pending work).
 
-State lives in STAGING_DIR/state.json; the script is idempotent and can be restarted at any time. It exits once the
+State lives in STAGING_DIR/<generation>/state.json; checkpoint identities prevent stale success on same-step restarts. It exits once the
 final checkpoint has been uploaded (or runs forever when UPLOAD_FINAL=0). Log: /tmp/dev/logs/upload-<EXP_NAME>.log.
 Needs HF_TOKEN in the environment (source /tmp/dev/env.sh first); the token must have write access to HF_REPO.
 """
@@ -36,6 +36,7 @@ Needs HF_TOKEN in the environment (source /tmp/dev/env.sh first); the token must
 from __future__ import annotations
 
 import datetime as dt
+import importlib.util
 import json
 import logging
 import os
@@ -46,12 +47,17 @@ import subprocess
 import sys
 import time
 
-from huggingface_hub import HfApi, RepoFile, RepoFolder
+from huggingface_hub import HfApi
+from huggingface_hub import RepoFolder
 from huggingface_hub.utils import HfHubHTTPError
 
 LOG_DIR = pathlib.Path(os.environ.get("B1K_LOG_DIR", "/tmp/dev/logs"))  # must match LOG_DIR of train_b1k_run.sh
 MAX_BACKOFF_SECONDS = 900
 LOG = logging.getLogger("uploader")
+
+_lifecycle_spec = importlib.util.spec_from_file_location("run_lifecycle", pathlib.Path(__file__).with_name("run_lifecycle.py"))
+lifecycle = importlib.util.module_from_spec(_lifecycle_spec)
+_lifecycle_spec.loader.exec_module(lifecycle)
 
 
 # --------------------------------------------------------------------------------------------- run.env / schedule
@@ -76,7 +82,10 @@ class RunSpec:
         self.exp_folder = env.get("HF_EXP_FOLDER") or self.exp_name  # folder of this experiment inside the repo
         self.openpi_dir = pathlib.Path(env["OPENPI_DIR"])
         self.ckpt_dir = self.openpi_dir / "outputs" / "checkpoints" / self.config_name / self.exp_name
-        self.staging_dir = pathlib.Path(env.get("STAGING_DIR", f"/tmp/dev/hf-staging/{self.exp_name}"))
+        self.staging_root = pathlib.Path(env.get("STAGING_DIR", f"/tmp/dev/hf-staging/{self.exp_name}"))
+        self.generation = lifecycle.generation(self.ckpt_dir)
+        self.staging_dir = self.staging_root / self.generation["id"]
+        self.state_path = self.staging_dir / "state.json"
         self.num_train_steps = int(env["NUM_TRAIN_STEPS"])
         self.every_until = int(env.get("UPLOAD_EVERY_UNTIL", 10_000))
         self.switch_step = int(env.get("UPLOAD_SWITCH_STEP", 50_000))
@@ -107,7 +116,7 @@ class RunSpec:
         return step % self.every_after == 0
 
     def planned_steps(self) -> list[int]:
-        steps = [s for s in range(0, self.num_train_steps) if self.wanted(s) and s != self.final_step]
+        steps = [s for s in range(self.num_train_steps) if self.wanted(s) and s != self.final_step]
         return steps + ([self.final_step] if self.upload_final else [])
 
     def describe_schedule(self) -> str:
@@ -131,12 +140,50 @@ def completed_steps(ckpt_dir: pathlib.Path) -> list[int]:
         if not meta.is_file() or not (child / "params").is_dir() or not (child / "assets").is_dir():
             continue
         try:
-            if json.loads(meta.read_text()).get("commit_timestamp_nsecs") is None:
-                continue
+            lifecycle.metadata_identity(meta.read_bytes(), {"id": "legacy", "started_ns": 0})
         except (OSError, ValueError):
             continue
         steps.append(int(child.name))
     return sorted(steps)
+
+
+def checkpoint_identity(spec, step: int) -> str:
+    return lifecycle.checkpoint_identity(spec.ckpt_dir, step, spec.generation)
+
+
+def current_steps(spec) -> list[int]:
+    steps = []
+    for step in completed_steps(spec.ckpt_dir):
+        try:
+            checkpoint_identity(spec, step)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        steps.append(step)
+    return steps
+
+
+def stage_path(spec: RunSpec, step: int, identity: str) -> pathlib.Path:
+    return spec.staging_dir / f"{step}-{identity}"
+
+
+def is_uploaded(spec: RunSpec, rec: dict) -> bool:
+    return bool(rec.get("uploaded_at") and rec.get("identity")) and rec.get("target") == spec.target and rec.get("generation") == spec.generation["id"]
+
+
+def staged_record(spec: RunSpec, step: int, rec: dict) -> bool:
+    if rec.get("generation") != spec.generation["id"] or not rec.get("identity") or not rec.get("staged_at"):
+        return False
+    path = stage_path(spec, step, rec["identity"])
+    try:
+        provenance = json.loads((path / "training_run.json").read_text())
+        return (
+            provenance.get("identity") == rec["identity"]
+            and provenance.get("generation") == spec.generation["id"]
+            and lifecycle.metadata_identity((path / "_CHECKPOINT_METADATA").read_bytes(), spec.generation) == rec["identity"]
+            and (path / "params").is_dir() and (path / "assets").is_dir()
+        )
+    except (OSError, ValueError):
+        return False
 
 
 def tree_stats(root: pathlib.Path) -> tuple[int, int]:
@@ -154,7 +201,7 @@ def git_commit(repo: pathlib.Path) -> str | None:
         out = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True
         )
-        dirty = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
+        dirty = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, check=False)
         return out.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -171,10 +218,11 @@ def train_loss_at(log_path: pathlib.Path, step: int) -> str:
 
 
 def stage(spec: RunSpec, step: int) -> dict:
-    """Copy the eval-only parts of checkpoint `step` to STAGING_DIR/<step>/ (atomically via a .tmp dir)."""
+    """Capture an immutable, generation- and checkpoint-specific eval copy."""
+    identity = checkpoint_identity(spec, step)
     src = spec.ckpt_dir / str(step)
-    dst = spec.staging_dir / str(step)
-    tmp = spec.staging_dir / f"{step}.tmp"
+    dst = stage_path(spec, step, identity)
+    tmp = dst.with_suffix(".tmp")
     if tmp.exists():
         shutil.rmtree(tmp)
     tmp.mkdir(parents=True)
@@ -188,7 +236,11 @@ def stage(spec: RunSpec, step: int) -> dict:
         if want != got:
             shutil.rmtree(tmp)
             raise RuntimeError(f"copy of {src / name} incomplete: source {want} vs copy {got} (files, bytes)")
+    if checkpoint_identity(spec, step) != identity or lifecycle.metadata_identity((tmp / "_CHECKPOINT_METADATA").read_bytes(), spec.generation) != identity:
+        raise RuntimeError(f"Checkpoint {step} changed while staging")
     provenance = {
+        "identity": identity,
+        "generation": spec.generation["id"],
         "exp_name": spec.exp_name,
         "config_name": spec.config_name,
         "step": step,
@@ -198,7 +250,7 @@ def stage(spec: RunSpec, step: int) -> dict:
         "train_state/ (optimizer state, resume only) intentionally omitted",
         "run_env": spec.raw,
         "openpi_git_commit": git_commit(spec.openpi_dir),
-        "staged_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "staged_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "serve_example": (
             f"uv run scripts/b1k/serve_b1k.py --robot b1k/R1Pro --task b1k/{spec.raw.get('TASK_NAMES', '<task>')} "
             f"--repo-id {spec.raw.get('REPO_ID', '<repo_id>')} --task-names {spec.raw.get('TASK_NAMES', '<task>')} "
@@ -212,14 +264,14 @@ def stage(spec: RunSpec, step: int) -> dict:
     files, bytes_ = tree_stats(dst)
     LOG.info("staged step %d -> %s (%d files, %.2f GiB) in %.0f s", step, dst, files, bytes_ / 2**30, time.time() - t0)
     return {"staged_at": provenance["staged_at"], "staged_files": files, "staged_bytes": bytes_, "path": str(dst),
-            "train_loss": provenance["train_loss"]}
+            "train_loss": provenance["train_loss"], "identity": identity, "generation": spec.generation["id"]}
 
 
 # ---------------------------------------------------------------------------------------------------- HF upload
 def experiment_readme(spec: RunSpec, steps: dict[str, dict]) -> str:
     env = spec.raw
     task = env.get("TASK_NAMES", "")
-    uploaded = sorted(int(s) for s, r in steps.items() if r.get("uploaded_at") and r.get("target") == spec.target)
+    uploaded = sorted(int(s) for s, r in steps.items() if is_uploaded(spec, r))
     rows = "\n".join(
         f"| `checkpoint-{s}/` | {s:,} | {steps[str(s)].get('train_loss', '-')} | {steps[str(s)]['uploaded_at'][:16].replace('T', ' ')} |"
         for s in uploaded
@@ -337,8 +389,16 @@ def ensure_cards(api: HfApi, spec: RunSpec, steps: dict[str, dict], *, n_uploade
 
 
 def upload(api: HfApi, spec: RunSpec, step: int, steps: dict[str, dict]) -> dict:
-    """Create the repo if needed, upload STAGING_DIR/<step> as <exp>/checkpoint-<step>/ and refresh the cards."""
-    src = spec.staging_dir / str(step)
+    with lifecycle.exclusive_lock(f"publish:{spec.ckpt_dir.resolve()}"):
+        return _upload(api, spec, step, steps)
+
+
+def _upload(api: HfApi, spec: RunSpec, step: int, steps: dict[str, dict]) -> dict:
+    """Publish checkpoint content and both cards before recording success."""
+    record = steps[str(step)]
+    if lifecycle.generation(spec.ckpt_dir) != spec.generation or not staged_record(spec, step, record):
+        raise RuntimeError(f"Staged checkpoint {step} does not match the current run")
+    src = stage_path(spec, step, record["identity"])
     t0 = time.time()
     api.create_repo(spec.hf_repo, repo_type="model", private=False, exist_ok=True)
     commit = api.upload_folder(
@@ -346,17 +406,23 @@ def upload(api: HfApi, spec: RunSpec, step: int, steps: dict[str, dict]) -> dict
         repo_type="model",
         folder_path=str(src),
         path_in_repo=spec.ckpt_path(step),
+        delete_patterns="*",
         commit_message=f"Add {spec.ckpt_path(step)} ({spec.exp_name})",
     )
     # Sanity check that the commit really holds the checkpoint before recording success.
     if not api.file_exists(spec.hf_repo, f"{spec.ckpt_path(step)}/params/manifest.ocdbt", repo_type="model"):
         raise RuntimeError(f"upload of step {step} returned but {spec.ckpt_path(step)}/params/manifest.ocdbt is not in the repo")
     url = getattr(commit, "commit_url", str(commit))
-    rec = {"uploaded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "target": spec.target,
+    rec = {"uploaded_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"), "target": spec.target,
            "repo": spec.hf_repo, "path": spec.ckpt_path(step), "commit": url}
+    proposed = {**steps, str(step): {**record, **rec}}
+    n_uploaded = sum(1 for r in proposed.values() if is_uploaded(spec, r))
+    ensure_cards(api, spec, proposed, n_uploaded=n_uploaded)
+    if lifecycle.generation(spec.ckpt_dir) != spec.generation:
+        raise RuntimeError("Run generation changed during upload")
+    if (spec.ckpt_dir / str(step)).exists() and checkpoint_identity(spec, step) != record["identity"]:
+        raise RuntimeError(f"Checkpoint {step} changed during upload")
     steps[str(step)].update(rec)
-    n_uploaded = sum(1 for r in steps.values() if r.get("uploaded_at") and r.get("target") == spec.target)
-    ensure_cards(api, spec, steps, n_uploaded=n_uploaded)
     LOG.info("uploaded step %d to https://huggingface.co/%s/tree/main/%s in %.0f s (%s)", step, spec.hf_repo, spec.ckpt_path(step), time.time() - t0, url)
     return rec
 
@@ -376,7 +442,7 @@ def explain_hf_error(e: Exception, repo: str) -> str:
 # -------------------------------------------------------------------------------------------------- monitoring
 def trainer_alive(spec: RunSpec) -> bool:
     try:
-        out = subprocess.run(["pgrep", "-f", f"train_b1k.py.*--exp_name={spec.exp_name}"], capture_output=True, text=True)
+        out = subprocess.run(["pgrep", "-f", f"train_b1k.py.*--exp_name={spec.exp_name}"], capture_output=True, text=True, check=False)
         return out.returncode == 0 and bool(out.stdout.strip())
     except OSError:
         return False
@@ -436,8 +502,9 @@ def main() -> int:
         LOG.error("HF_TOKEN is not set; run `source /tmp/dev/env.sh` first")
         return 2
     spec.staging_dir.mkdir(parents=True, exist_ok=True)
-    state_path = spec.staging_dir / "state.json"
+    state_path = spec.state_path
     state = load_state(state_path)
+    state.setdefault("steps", {})
     api = HfApi(token=os.environ["HF_TOKEN"])
     LOG.info("=== uploader for %s: checkpoints %s -> staging %s -> https://huggingface.co/%s/tree/main/%s ===", spec.exp_name, spec.ckpt_dir, spec.staging_dir, spec.hf_repo, spec.exp_folder)
     LOG.info("schedule: %s; poll every %d s", spec.describe_schedule(), spec.poll_seconds)
@@ -452,14 +519,34 @@ def main() -> int:
             spec = RunSpec(read_run_env(run_env_path))  # live-reloadable: HF_REPO, schedule, NUM_TRAIN_STEPS
         except (OSError, KeyError, ValueError) as e:
             LOG.error("cannot re-read %s (%s); keeping previous settings", run_env_path, e)
+        if state_path != spec.state_path:
+            state_path = spec.state_path
+            spec.staging_dir.mkdir(parents=True, exist_ok=True)
+            state = load_state(state_path)
+            state.setdefault("steps", {})
+            cards_target = None
         steps = state["steps"]
-        on_disk = completed_steps(spec.ckpt_dir)
+        on_disk = current_steps(spec)
         latest = on_disk[-1] if on_disk else None
+        for step in on_disk:
+            if not spec.wanted(step):
+                continue
+            try:
+                identity = checkpoint_identity(spec, step)
+            except (OSError, ValueError, RuntimeError):
+                continue
+            rec = steps.get(str(step), {})
+            if rec.get("identity") != identity or rec.get("generation") != spec.generation["id"]:
+                steps[str(step)] = {}
+        for step, rec in list(steps.items()):
+            if rec.get("staged_at") and not staged_record(spec, int(step), rec):
+                steps[step] = {}
+        save_state(state_path, state)
 
         # 0. make sure the repo and its cards exist (so the experiment shows up before the first checkpoint)
         if cards_target != spec.target:
             try:
-                n_uploaded = sum(1 for r in steps.values() if r.get("uploaded_at") and r.get("target") == spec.target)
+                n_uploaded = sum(1 for r in steps.values() if is_uploaded(spec, r))
                 ensure_cards(api, spec, steps, n_uploaded=n_uploaded)
                 cards_target = spec.target
                 LOG.info("repo https://huggingface.co/%s ready; cards written for %s", spec.hf_repo, spec.exp_folder)
@@ -476,22 +563,18 @@ def main() -> int:
             try:
                 rec.update(stage(spec, step))
                 save_state(state_path, state)
-            except Exception as e:  # noqa: BLE001 -- keep the loop alive, retry next cycle
+            except Exception as e:
                 LOG.error("staging step %d failed: %s", step, e)
         # 2. wanted steps that are gone from disk without having been staged: record once
         if latest is not None:
-            for step in range(0, latest + 1):
-                if spec.wanted(step) and step not in on_disk and not steps.get(str(step), {}).get("staged_at"):
-                    if not steps.get(str(step), {}).get("missed"):
-                        steps.setdefault(str(step), {})["missed"] = True
-                        LOG.warning("step %d was on the upload schedule but is no longer on disk and was never staged", step)
-                        save_state(state_path, state)
+            for step in range(latest + 1):
+                if spec.wanted(step) and step not in on_disk and not steps.get(str(step), {}).get("staged_at") and not steps.get(str(step), {}).get("missed"):
+                    steps.setdefault(str(step), {})["missed"] = True
+                    LOG.warning("step %d was on the upload schedule but is no longer on disk and was never staged", step)
+                    save_state(state_path, state)
 
         # 3. upload staged steps (oldest first), with per-step backoff
-        def is_uploaded(r: dict) -> bool:
-            return bool(r.get("uploaded_at")) and r.get("target") == spec.target
-
-        pending = sorted(int(s) for s, r in steps.items() if r.get("staged_at") and not is_uploaded(r))
+        pending = sorted(int(s) for s, r in steps.items() if staged_record(spec, int(s), r) and not is_uploaded(spec, r))
         now = time.time()
         for step in pending:
             rec = steps[str(step)]
@@ -519,8 +602,8 @@ def main() -> int:
                 save_state(state_path, state)
 
         # 4. heartbeat
-        uploaded = sorted(int(s) for s, r in steps.items() if is_uploaded(r))
-        pending = sorted(int(s) for s, r in steps.items() if r.get("staged_at") and not is_uploaded(r))
+        uploaded = sorted(int(s) for s, r in steps.items() if is_uploaded(spec, r))
+        pending = sorted(int(s) for s, r in steps.items() if r.get("staged_at") and not is_uploaded(spec, r))
         if cycle == 1 or cycle % 10 == 0 or pending:
             LOG.info(
                 "heartbeat: latest checkpoint %s (on disk: %s) | trainer alive: %s | %s | uploaded: %s | staged, waiting for upload: %s",

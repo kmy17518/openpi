@@ -10,8 +10,8 @@
 # What it does:
 #   1. sources $ENV_FILE if it exists (default /tmp/dev/env.sh: caches under /tmp, HF_TOKEN / WANDB_API_KEY,
 #      WANDB_BASE_URL) and then the run definition file (KEY=VALUE, see scripts/b1k/runs/*.env),
-#   2. waits until the GPUs in CUDA_VISIBLE_DEVICES are idle (no compute process, < 4 GiB used) so it never
-#      fights another job for memory -- launch it early and it starts by itself,
+#   2. acquires nonblocking experiment/physical-GPU leases, then waits for CUDA_VISIBLE_DEVICES to be idle
+#      (no compute process, < 4 GiB used); a competing run or overlapping allocation fails immediately,
 #   3. runs scripts/b1k/train_b1k.py with the run's flags, output tee'd to $LOG_DIR/train-<EXP_NAME>.log
 #      (default LOG_DIR=/tmp/dev/logs),
 #   4. if the trainer dies, waits 60 s and relaunches with --resume; gives up after 3 consecutive failures that did
@@ -38,22 +38,22 @@ set -a
 source "$RUN_ENV"
 set +a
 # OPENPI_DIR defaults to the checkout this script lives in.
-OPENPI_DIR=${OPENPI_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+OPENPI_DIR=${OPENPI_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}
 LOG_DIR=${LOG_DIR:-/tmp/dev/logs}
 LOG_FILE="$LOG_DIR/train-$EXP_NAME.log"
 mkdir -p "$LOG_DIR"
 CKPT_DIR="$OPENPI_DIR/outputs/checkpoints/$CONFIG_NAME/$EXP_NAME"
 
+if [ "${B1K_LAUNCHER_GUARDED:-0}" != 1 ]; then
+    exec "$VENV/bin/python" "$SCRIPT_DIR/run_lifecycle.py" launch "$CKPT_DIR" bash "$SCRIPT_DIR/train_b1k_run.sh" "$RUN_ENV" "$MODE"
+fi
+unset B1K_LAUNCHER_GUARDED
+
 log() { echo "[$(date '+%F %T')] [launcher] $*" | tee -a "$LOG_FILE"; }
 
-latest_step() {  # newest completed checkpoint step in CKPT_DIR, or -1
-    local best=-1 d
-    [ -d "$CKPT_DIR" ] || { echo -1; return; }
-    for d in "$CKPT_DIR"/*/; do
-        d=$(basename "$d")
-        [[ "$d" =~ ^[0-9]+$ ]] && [ -f "$CKPT_DIR/$d/_CHECKPOINT_METADATA" ] && [ "$d" -gt "$best" ] && best=$d
-    done
-    echo "$best"
+latest_step() {
+    "$VENV/bin/python" "$SCRIPT_DIR/run_lifecycle.py" latest "$CKPT_DIR"
 }
 
 gpus_idle() {  # 0 if every GPU in CUDA_VISIBLE_DEVICES has < GPU_FREE_MIB used and no compute process anywhere
@@ -110,6 +110,12 @@ case "$MODE" in
 esac
 [ "$(latest_step)" -ge 0 ] && log "existing checkpoints in $CKPT_DIR, latest step $(latest_step)"
 
+GENERATION_MODE=resume
+if [ "$MODE" = fresh ] || { [ "$MODE" = auto ] && [ ! -d "$CKPT_DIR" ]; }; then
+    GENERATION_MODE=fresh
+fi
+"$VENV/bin/python" "$SCRIPT_DIR/run_lifecycle.py" generation "$CKPT_DIR" "$GENERATION_MODE" || exit 2
+
 failures=0
 step_at_last_failure=$(latest_step)
 while true; do
@@ -129,6 +135,9 @@ while true; do
         exit "$rc"
     fi
     MODE_FLAG=--resume
-    log "relaunching with --resume in 60 s"
+    if [ "$GENERATION_MODE" = fresh ] && [ "$now_step" -lt 0 ]; then
+        MODE_FLAG=--overwrite
+    fi
+    log "relaunching with $MODE_FLAG in 60 s"
     sleep 60
 done

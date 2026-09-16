@@ -142,12 +142,11 @@ class Policy(BasePolicy):
             )
             sample_rng_or_pytorch_device = self._pytorch_device
 
-        # Prepare kwargs for sample_actions. If provided, noise is expected to already be batched
-        # as (batch, action_horizon, action_dim).
         sample_kwargs = dict(self._sample_kwargs)
+        if noise is None:
+            noise = sample_kwargs.get("noise")
         if noise is None and not self._is_pytorch_model and self._sample_actions_accepts_noise:
-            # Match N sequential infer() calls exactly: each example gets the key it would have received
-            # independently. A single batch RNG changes both this batch and the RNG stream of later calls.
+            # Each example gets the key it would receive in sequential inference; output rounding can differ.
             noise = jnp.concatenate(
                 [
                     jax.random.normal(key, (1, self._model.action_horizon, self._model.action_dim))
@@ -156,11 +155,18 @@ class Policy(BasePolicy):
                 axis=0,
             )
         if noise is not None:
-            noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
-            if noise.ndim == 2 and len(obs_list) == 1:
+            noise = (
+                torch.as_tensor(noise, device=self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+            )
+            expected = (len(obs_list), self._model.action_horizon, self._model.action_dim)
+            if noise.ndim == 2:
                 noise = noise[None, ...]
-            if noise.shape[0] != len(obs_list):
-                raise ValueError(f"Batched noise has batch size {noise.shape[0]}, expected {len(obs_list)}")
+            if noise.ndim != 3 or noise.shape[1:] != expected[1:] or noise.shape[0] not in (1, expected[0]):
+                raise ValueError(f"Batched noise has shape {noise.shape}, expected {expected} or a shared sample")
+            if noise.shape[0] == 1:
+                noise = (
+                    torch.broadcast_to(noise, expected) if self._is_pytorch_model else jnp.broadcast_to(noise, expected)
+                )
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
