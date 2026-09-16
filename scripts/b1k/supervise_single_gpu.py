@@ -87,6 +87,7 @@ def main() -> int:
         MKL_NUM_THREADS="2",
         NUMEXPR_NUM_THREADS="2",
         XLA_PYTHON_CLIENT_PREALLOCATE="false",
+        XLA_PYTHON_CLIENT_MEM_FRACTION=str(settings.get("memory_fraction", 0.95)),
         JAX_PLATFORMS="cuda",
         PYTHONUNBUFFERED="1",
     )
