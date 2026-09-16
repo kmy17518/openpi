@@ -3,6 +3,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -423,7 +424,7 @@ def train_step(
     return new_state, info
 
 
-def main(config: _config.TrainConfig):
+def main(config: _config.TrainConfig, *, observer=None):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -511,8 +512,11 @@ def main(config: _config.TrainConfig):
         ) as pbar:
             infos = []
             for step in pbar:
+                step_started = time.monotonic()
                 with sharding.set_mesh(mesh):
                     train_state, info = ptrain_step(train_rng, train_state, batch)
+                if observer is not None:
+                    observer.on_step(step + 1, jax.device_get(info), time.monotonic() - step_started)
                 infos.append(info)
                 if step % config.log_interval == 0:
                     stacked_infos = common_utils.stack_forest(infos)
@@ -528,9 +532,15 @@ def main(config: _config.TrainConfig):
                     if val_loss is not None:
                         wandb.log({"val_loss": val_loss}, step=step)
                         logging.info("Validation loss at step %d: %.4f", step, val_loss)
-                batch = next(data_iter)
+                if step + 1 < config.num_train_steps:
+                    batch = next(data_iter)
 
-                if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                if observer is not None:
+                    if observer.should_save(step + 1):
+                        _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step + 1)
+                        checkpoint_manager.wait_until_finished()
+                        observer.on_checkpoint(config.checkpoint_dir / str(step + 1), step + 1)
+                elif (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
                     _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
         logging.info("Waiting for checkpoint manager to finish")
@@ -539,6 +549,7 @@ def main(config: _config.TrainConfig):
         close = getattr(data_iter, "close", None)
         if close is not None:
             close()
+        checkpoint_manager.close()
 
 
 if __name__ == "__main__":
