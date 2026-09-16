@@ -45,6 +45,8 @@ def command_lines(settings: dict, config_path: Path):
         str(config_path),
         "--wandb-url",
         settings["wandb_url"],
+        "--wandb-id",
+        settings["wandb_run_id"],
         "--max-steps",
         str(settings["max_steps"]),
         "--eval-every",
