@@ -549,10 +549,15 @@ def main(config: _config.TrainConfig, *, observer=None):
         logging.info("Waiting for checkpoint manager to finish")
         checkpoint_manager.wait_until_finished()
     finally:
-        close = getattr(data_iter, "close", None)
-        if close is not None:
-            close()
-        checkpoint_manager.close()
+        try:
+            close = getattr(data_iter, "close", None)
+            if isinstance(data_iter, _data_loader.PrefetchIterator):
+                if not data_iter.close(timeout=60):
+                    raise RuntimeError("Data-loader producer did not finish cleanup within60 seconds")
+            elif close is not None:
+                close()
+        finally:
+            checkpoint_manager.close()
 
 
 if __name__ == "__main__":
