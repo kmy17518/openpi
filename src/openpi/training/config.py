@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import numbers
 import pathlib
 from typing import Annotated, Any, List, Literal, Protocol, TypeAlias
 
@@ -24,6 +25,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.training.b1k_artifacts as _b1k_artifacts
 import openpi.training.b1k_dataset as _b1k_dataset
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.lerobot_compat as _lerobot_compat
@@ -119,6 +121,11 @@ class DataConfig:
     # behavior), or "task_description" -- the natural-language instruction from the dataset's `meta/tasks.jsonl`
     # (fallback: `configs/tasks/b1k.py`). Recorded in the checkpoint assets so serve_b1k.py prompts the same way.
     prompt_source: _b1k_dataset.PromptSource = _b1k_dataset.DEFAULT_PROMPT_SOURCE
+    # Robot/action conventions and their saved statistics/checkpoint provenance.
+    action_representation: dict[str, Any] | None = None
+    norm_stats_metadata: dict[str, Any] | None = None
+    inference_metadata: dict[str, Any] | None = None
+    allow_legacy_assets: bool = False
 
 
 class GroupFactory(Protocol):
@@ -394,8 +401,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     dataset_root: Annotated[str | None, tyro.conf.arg(aliases=["--data.base-config.dataset-root"])] = None
     # Train only on these tasks (task strings as in `meta/tasks.parquet`, e.g. `turning_on_radio`); default: every
     # task under `dataset_root`. Only the selected tasks' episodes are loaded and their norm stats are computed over
-    # those episodes alone, under the asset id `<repo_id>/task_subsets/<key>`. Unknown names, or a root that holds
-    # none of the selected tasks (a partial download of other tasks), fail fast. Overrides `base_config.task_names`.
+    # those episodes alone, under the asset id `<repo_id>/task_subsets/<key>`. Unknown names, or a root missing
+    # episodes for any selected task, fail fast. Overrides `base_config.task_names`.
     # CLI: --data.task-names TASK [TASK ...]
     task_names: Sequence[str] | None = None
     # Text the policy is prompted with: `task_name` (the snake_case task id from `meta/tasks.parquet`, e.g.
@@ -404,6 +411,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # checkpoint so `serve_b1k.py` prompts with the same kind of text. Overrides `base_config.prompt_source`.
     # CLI: --data.prompt-source task_description
     prompt_source: _b1k_dataset.PromptSource | None = None
+    # Permit unversioned assets only after checking their robot/action convention.
+    allow_legacy_assets: bool = False
 
     @override
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -418,6 +427,11 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         if asset_id is None and repo_id is not None:
             # A task subset has its own norm stats: `<repo_id>/task_subsets/<key>` (`<repo_id>` for the whole dataset).
             asset_id = repo_id if isinstance(repo_id, list) else _b1k_dataset.task_subset_asset_id(repo_id, task_names)
+        assets_dir = epath.Path(self.assets.assets_dir or assets_dirs)
+        metadata_asset_id = next(iter(asset_id), None) if isinstance(asset_id, list) else asset_id
+        norm_stats_metadata = (
+            _b1k_artifacts.load_metadata(assets_dir / metadata_asset_id) if metadata_asset_id is not None else None
+        )
         return dataclasses.replace(
             base_config,
             repo_id=repo_id,
@@ -425,7 +439,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             dataset_root=dataset_root,
             task_names=task_names,
             prompt_source=prompt_source,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=self._load_norm_stats(assets_dir, asset_id),
+            norm_stats_metadata=norm_stats_metadata,
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -434,7 +449,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
         `state_indices` index the state vector that `B1KInputs` extracts from the proprio groups (concatenated in
         order, each `is_eef` group reduced to a single dim). Delta action groups with `delta_state_indices` use them
-        as given; the others are matched, in order, to the next not-yet-used proprio slice of the same size.
+        as given; the others are matched, in order, to the next fully unoccupied proprio slice of the same size.
+        Explicit groups may share state dimensions for distinct actions, but inference never reuses them.
         """
         state_slices = []
         state_offset = 0
@@ -444,35 +460,52 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             state_offset += dim
         state_dim = state_offset
 
+        delta_groups = [group for group in robot_config.action if group.needs_delta_comp and not group.is_eef]
+        occupied_state: set[int] = set()
+        occupied_actions: set[int] = set()
+
+        def validate_indices(indices, dim, label, group):
+            if any(isinstance(i, bool) or not isinstance(i, numbers.Integral) or not 0 <= i < dim for i in indices):
+                raise ValueError(
+                    f"Delta action group {group.name!r}: {label} {indices} must be integers in range [0, {dim}) "
+                    f"in robot config {robot_config.robot_type!r}."
+                )
+            if len(set(indices)) != len(indices):
+                raise ValueError(f"Delta action group {group.name!r}: duplicate {label} {indices}.")
+
+        # Explicit mappings reserve their dimensions regardless of action-group order.
+        for group in delta_groups:
+            validate_indices(group.indices, robot_config.action_dim, "action indices", group)
+            if overlap := occupied_actions.intersection(group.indices):
+                raise ValueError(f"Delta action group {group.name!r}: already mapped action indices {sorted(overlap)}.")
+            occupied_actions.update(group.indices)
+            if group.delta_state_indices is not None:
+                if len(group.delta_state_indices) != len(group.indices):
+                    raise ValueError(
+                        f"Delta action group {group.name!r} has {len(group.indices)} action indices but "
+                        f"{len(group.delta_state_indices)} delta_state_indices in robot config {robot_config.robot_type!r}."
+                    )
+                validate_indices(group.delta_state_indices, state_dim, "delta_state_indices", group)
+                occupied_state.update(group.delta_state_indices)
+
         mappings = []
         state_slice_index = 0
-        for action_config in robot_config.action:
-            if action_config.is_eef or not action_config.needs_delta_comp:
+        for group in delta_groups:
+            if group.delta_state_indices is not None:
+                mappings.append((list(group.indices), list(group.delta_state_indices)))
                 continue
-            action_dim = len(action_config.indices)
-            if action_config.delta_state_indices is not None:
-                state_indices = list(action_config.delta_state_indices)
-                if len(state_indices) != action_dim:
-                    raise ValueError(
-                        f"Delta action group {action_config.name!r} has {action_dim} action indices but "
-                        f"{len(state_indices)} delta_state_indices in robot config {robot_config.robot_type!r}."
-                    )
-                if any(not 0 <= i < state_dim for i in state_indices):
-                    raise ValueError(
-                        f"Delta action group {action_config.name!r}: delta_state_indices {state_indices} out of range "
-                        f"for the {state_dim}-dim extracted state of robot config {robot_config.robot_type!r}."
-                    )
-                mappings.append((list(action_config.indices), state_indices))
-                continue
-            while state_slice_index < len(state_slices) and len(state_slices[state_slice_index]) != action_dim:
+            while state_slice_index < len(state_slices):
+                state_indices = state_slices[state_slice_index]
                 state_slice_index += 1
-            if state_slice_index >= len(state_slices):
+                if len(state_indices) == len(group.indices) and occupied_state.isdisjoint(state_indices):
+                    break
+            else:
                 raise ValueError(
-                    f"Could not find a state slice for delta action group {action_config.name!r} "
-                    f"with dim {action_dim} in robot config {robot_config.robot_type!r}."
+                    f"Could not find an unoccupied state slice for delta action group {group.name!r} "
+                    f"with dim {len(group.indices)} in robot config {robot_config.robot_type!r}."
                 )
-            mappings.append((action_config.indices, state_slices[state_slice_index]))
-            state_slice_index += 1
+            mappings.append((list(group.indices), state_indices))
+            occupied_state.update(state_indices)
         return mappings
 
     @override
@@ -505,6 +538,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         )
 
         # extra delta transform.
+        delta_mappings = []
         if self.extra_delta_transform:
             delta_mappings = self._build_delta_mappings(robot_config)
 
@@ -533,9 +567,15 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 **dataset_kwargs,
             }
 
+        action_representation = _b1k_artifacts.action_representation(
+            robot_config, extra_delta_transform=self.extra_delta_transform
+        )
+        action_representation["delta_mappings"] = [[list(a), list(s)] for a, s in delta_mappings]
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
             base_config,
+            action_representation=action_representation,
+            allow_legacy_assets=self.allow_legacy_assets,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,

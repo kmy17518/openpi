@@ -11,7 +11,7 @@ generic (one *run definition file* per run under `scripts/b1k/runs/`); the concr
 | `scripts/b1k/runs/single-task-turning-on-radio-bs512.env` | Run definition: every training flag, path, HF repo/folder and the upload schedule (shell `KEY=VALUE`). The one file to edit for a new run. |
 | `scripts/b1k/train_b1k_run.sh` | Training launcher: waits for idle GPUs, runs `scripts/b1k/train_b1k.py` with the run's flags, tees the log, auto-`--resume`s after a crash. |
 | `scripts/b1k/hf_checkpoint_uploader.py` | Monitor 1: eval-only copies of scheduled checkpoints → `<HF_REPO>/<exp>/checkpoint-<step>/`, keeps the repo READMEs. |
-| `scripts/b1k/hf_latest_full_checkpoint_uploader.py` | Monitor 2: the newest full (resumable) checkpoint → `<HF_REPO>/<exp>/resume/checkpoint-<step>/`, purging superseded LFS objects. |
+| `scripts/b1k/hf_latest_full_checkpoint_uploader.py` | Monitor 2: the newest full (resumable) checkpoint → `<HF_REPO>/<exp>/resume/checkpoint-<step>/`, removing superseded paths without rewriting history or deleting LFS objects. |
 | `scripts/b1k/setup_jax_cuda13_venv.sh` | Builds the jax 0.10.2 + CUDA 13 venv the runs train in (`venv-openpi-jax010`). |
 | `scripts/b1k/venv-openpi-jax010-freeze.txt` | Exact package set of that venv (`uv pip freeze`), used by the builder for bit-for-bit rebuilds. |
 | `scripts/b1k/train_b1k.py`, `scripts/compute_norm_stats.py`, `scripts/b1k/serve_b1k.py` | The trainer, the norm-stats script and the policy server (see [b1k.md](./b1k.md)). |
@@ -136,6 +136,18 @@ default: resume if the directory exists) or `resume` otherwise. The `. /tmp/dev/
 any Python ≥ 3.10 with `huggingface_hub >= 1.0` and `hf_xet` works (here the `hf` conda env; the pinned `.venv`
 also qualifies).
 
+Each fresh launch records a generation UUID in the sibling `.EXP_NAME.generation.json` file beside the checkpoint
+run directory. Upload state and staging are isolated under that generation; checkpoint identities also include
+Orbax commit metadata, so a new checkpoint at an old numeric step is not mistaken for an already uploaded model.
+Keep this marker with the run. Both monitors include generation/identity provenance remotely and preserve all
+checkpoint assets, including `b1k_metadata.json`. Full checkpoints are staged as immutable copies before uploading:
+allow disk space for those copies in addition to the trainer's retained checkpoints.
+
+Cooperating launchers/uploaders must share `B1K_LOCK_DIR` (default `/tmp/openpi-b1k-locks`). Locks are nonblocking:
+a duplicate experiment, an overlapping physical GPU allocation, or a fresh launch during active publication fails
+clearly instead of waiting to overwrite later. These locks coordinate this host's processes, not independent hosts
+or arbitrary external uploaders.
+
 ### The exact training command the launcher runs
 
 `train_b1k_run.sh` assembles this from the run definition and logs it as a `launching:` line; for this run it is
@@ -164,7 +176,8 @@ peak of this configuration is ~137 GiB per GPU.
 
 `scripts/b1k/train_b1k_run.sh <run.env> [auto|fresh|resume]`
 
-1. sources `$ENV_FILE` (default `/tmp/dev/env.sh`) if present, then the run definition;
+1. sources `$ENV_FILE` (default `/tmp/dev/env.sh`) if present, then the run definition; acquires exclusive per-run
+   and physical-GPU locks before checking idle status (competing runs fail rather than queue a future overwrite);
 2. waits until every GPU in `CUDA_VISIBLE_DEVICES` is idle (no compute process anywhere, < 4 GiB used) for 60 s —
    so it can be started while something else still runs on the GPUs and never fights it for memory;
 3. runs the trainer with `stdout/stderr` tee'd to `$LOG_DIR/train-<EXP_NAME>.log` (`LOG_DIR` default `/tmp/dev/logs`);
@@ -176,26 +189,28 @@ peak of this configuration is ~137 GiB per GPU.
 
 **`hf_checkpoint_uploader.py`** (poll: `UPLOADER_POLL_SECONDS`, 60 s). For every completed checkpoint on the
 schedule it copies `params/` (EMA weights, 12 GB), `assets/` (norm stats + `prompt_source.json`) and
-`_CHECKPOINT_METADATA` to `STAGING_DIR/<step>/` (verified by file count + bytes; `train_state/` is never copied),
+`_CHECKPOINT_METADATA` to generation-and-checkpoint-identity-specific staging (verified by file count + bytes; `train_state/` is never copied),
 adds `training_run.json` (provenance: run definition, git commit, train loss at that step, a serve command), uploads
 it as `<HF_EXP_FOLDER>/checkpoint-<step>/`, checks `…/params/manifest.ocdbt` exists in the repo and refreshes the
 experiment README (recipe + table `checkpoint | step | train loss | uploaded`) and the root README (experiment
 index). A checkpoint counts as complete when its directory has its final numeric name and `_CHECKPOINT_METADATA`
 carries `commit_timestamp_nsecs` (orbax writes to a temp dir and renames). The copy happens within a minute of the
 save, long before `max_to_keep` deletes the checkpoint (3 × 2,500 steps ≈ 4 h later). Failures retry with backoff
-(1 → 15 min); staged copies wait on disk; state in `STAGING_DIR/state.json`. Exits after the final step is uploaded.
+(1 → 15 min); staged copies wait on disk; state in `STAGING_DIR/<generation>/state.json`. Exits after the final step of the current generation is uploaded.
 
 **`hf_latest_full_checkpoint_uploader.py`** (poll: `FULL_UPLOADER_POLL_SECONDS`, 120 s). Whenever the newest
 complete checkpoint differs from the one in `<HF_EXP_FOLDER>/resume/`, it uploads the whole checkpoint directory
 (params + train_state + assets, ~42 GB, ~1 GB/s here) as `resume/checkpoint-<step>/`, verifies the remote tree
 against the local one file by file (paths + sizes), writes `resume/LATEST.json`, `resume/wandb_id.txt`,
-`resume/README.md`, deletes every other `resume/checkpoint-*` folder and then **permanently deletes the LFS objects
-nothing in the repo tree references any more** (`HfApi.permanently_delete_lfs_files(rewrite_history=True)`), so
-superseded checkpoints do not stay in history and count against the storage quota. Because the Hub deduplicates by
-content hash and `checkpoint-<S>/params/` is byte-identical to `resume/checkpoint-<S>/params/`, the purge is scoped to
-objects unreferenced by the *whole* tree (never "by folder"), and never touches objects pushed in the last 30 min
-(the other monitor may be mid-commit). The bytes the Hub still lists vs. the bytes the tree references are logged
-after every hand-over (HF's accounting can lag hours). State in `STAGING_DIR/full-state.json`.
+`resume/README.md`, then removes superseded `resume/checkpoint-*` paths using normal Hub commits. Metadata is
+reconciled on retries even when the checkpoint content already exists; older checkpoints are retained until all
+resume metadata is published successfully. The mirror **never permanently deletes LFS objects or rewrites history**:
+other branches/tags and concurrent uploaders cannot be protected safely by a default-branch tree snapshot. Storage
+quota is therefore not reclaimed by this mirror. Any permanent history cleanup is a separate administrative action.
+State is kept under `STAGING_DIR/<generation>/full-state.json`. Publication also rechecks local/remote freshness
+under the lock, so a delayed older upload cannot move `LATEST.json` backward or delete a newer checkpoint.
+Higher-numbered folders from an older run generation may remain after a fresh restart; `LATEST.json` identifies
+the active generation and checkpoint.
 
 Resulting repo layout:
 

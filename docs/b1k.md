@@ -273,7 +273,18 @@ The challenge demos carry two kinds of text per task (`meta/tasks.jsonl`). The p
 
 The choice is recorded in the checkpoint (`assets/<asset_id>/prompt_source.json`, next to the norm stats), and `serve_b1k.py` prompts with the same kind of text automatically; `--prompt-source task_name|task_description` overrides it at serve time and `--text-prompt "..."` sets the text verbatim. Checkpoints trained before `--data.prompt-source` existed were trained on task names but this script served them with descriptions; they keep being served with descriptions unless you pass `--prompt-source task_name`.
 
-π₀.₅ tokenizes the prompt together with the discretized state into `max_token_len` (200) tokens and truncates from the end. The longest instructions do not fit next to the 32-dim state, so training with `task_description` fails fast for such tasks and tells you the `--model.max-token-len` to pass (e.g. `--model.max-token-len 256`).
+π₀.₅ tokenizes the prompt together with the discretized state into `max_token_len` (200) tokens and truncates from the end. The length check uses the extracted B1K state (23 dimensions for R1Pro), before model padding. Training fails fast when a selected instruction does not fit and reports the `--model.max-token-len` needed. Serving restores that budget from new checkpoints and validates the selected prompt too; for older checkpoints use `--max-token-len` explicitly if necessary.
+
+New checkpoints save `b1k_metadata.json` alongside their statistics: the exact resolved task prompts, inference-relevant model settings, and robot/action representation. Serving uses the recorded prompt by default, including dataset-specific text and custom tasks absent from the registry. `--text-prompt` and `--prompt-source` remain explicit overrides. Resume rejects changed prompts, model settings, or action conventions rather than mixing training definitions.
+
+#### Action-representation compatibility
+
+New normalization statistics also include `b1k_metadata.json`. Training, serving, and resume validate its action convention; a known mismatch is always rejected. This matters for the R1Pro torso change: current `b1k/R1Pro` predicts trunk joints1–3 as deltas and joint4 as an absolute target, while older checkpoints predicted all four as deltas.
+
+- Recompute statistics with the current `compute_norm_stats.py` before new training.
+- To serve an old four-joint torso-delta checkpoint, select `--robot b1k/R1Pro-legacy-torso-delta` and its matching old statistics.
+- Unversioned artifacts fail closed. After verifying their convention, explicitly allow them with `--allow-legacy-assets` at serving or `--data.allow-legacy-assets` for training/resume. This permission accepts missing metadata only; it never overrides a recorded mismatch.
+- The serving token override is `--max-token-len`; the training override is `--model.max-token-len`. Changing the execution chunk length does not change the trained action representation.
 
 #### SLURM cluster
 
@@ -313,8 +324,8 @@ uv run scripts/b1k/serve_b1k.py \
 This starts a WebSocket policy server on `0.0.0.0:8000`. The server:
 
 1. Prompts with the kind of text the checkpoint was trained on: the task name `<TASK_NAME>` itself, or its instruction from `TASK_REGISTRY["b1k"]["<TASK_NAME>"]` (see [Language prompt](#language-prompt))
-2. Wraps the policy with `B1KPolicyWrapper` for receding-horizon action execution
-3. Accepts observations keyed by the R1Pro `obs_key` definitions in the robot config
+2. Predicts `m=config.model.action_horizon` actions once per request and returns only the first `n=--action-horizon` actions
+3. Uses Andi's existing BEHAVIOR response format: `action` plus `action_chunk`, with `action` equal to the chunk's first action. Set the evaluator's `--replay-action-chunk-size` to match the server's `--action-horizon`
 
 **Optional serve flags**
 
@@ -324,12 +335,26 @@ This starts a WebSocket policy server on `0.0.0.0:8000`. The server:
 | `--task-names` | none | Task subset the checkpoint was trained on (`--data.task-names` of training); selects that subset's norm stats in the checkpoint. If omitted and the checkpoint holds a single norm-stats file, that one is used with a warning |
 | `--prompt-source` | recorded in checkpoint | `task_name` or `task_description`; overrides the prompt kind the checkpoint was trained with (see [Language prompt](#language-prompt)) |
 | `--text-prompt` | none | Prompt the policy with exactly this text |
-| `--control_mode` | `receding_horizon` | Action execution mode |
-| `--action_horizon` | `16` | Steps to execute before replanning |
+| `--control_mode` | `receding_horizon` | Required for fixed-chunk serving; temporal modes are rejected |
+| `--action_horizon` | `16` | Required chunk length `n`, with `1 <= n <= m`; model prediction horizon `m` stays consistent with training |
 | `--port` | `8000` | Server port |
 | `--record` | `false` | Record policy I/O for debugging |
 
-Point your BEHAVIOR-1K robot client at the server host and port to stream observations and receive actions.
+#### Fixed action chunks and vectorized evaluation
+
+Both servers preserve the existing BEHAVIOR chunk format; no replacement client or evaluator patch is needed for the inspected `vector` branch.
+
+- **Server:** `--action-horizon n` sets how many actions to return, independently of the batch size and model prediction horizon `m`.
+- **Evaluator:** `--replay-action-chunk-size n` sets `__action_chunk_size__=n` in observation requests. The values must match; the server rejects mismatches before inference. The client's default `0` disables chunk requests, rather than negotiating with the server.
+- **Response:** `action_chunk` has shape `(n, D)` or `(B, n, D)`, and `action = action_chunk[..., 0, :]`. Each chunk comes from one fresh prediction, with the unused `m-n` tail discarded.
+- **Execution:** the existing client buffers the chunk, returns one action per environment per control step, then sends new observations after `n` actions. It does not send a separate acknowledgement of executed steps.
+- **Reset:** the existing `{"reset": true}` message receives no reply. The client clears its buffered actions; its next observation starts a new plan.
+
+For `n=16`, pass `--action-horizon 16` to either model server and add `--replay-action-chunk-size 16` to the BEHAVIOR evaluation command. For `n=1`, the existing client omits the chunk field; a server configured with `--action-horizon 1` accepts that as a one-action request. Missing chunk sizes are rejected when the server requires more than one action.
+
+The inspected BEHAVIOR `vector` client uses a fixed `(B, n, D)` buffer with one shared cursor. This works for its synchronized vectorized evaluation: all slots advance together, finished slots stay inactive, and the next batch resets the whole buffer. Independently restarting one slot within a live batch would require additional client scheduling and is not claimed here. A separate client per environment has its own buffer and reset independently.
+
+Compatibility tests using the unmodified client are in [`examples/b1k`](../examples/b1k/README.md). Temporal-ensemble modes are not used for fixed chunks because they require intermediate observations. A GR00T checkpoint predicting 16 actions can execute fewer (for example `n=8`); a larger prediction horizon requires a matching trained checkpoint, not merely a larger execution flag.
 
 ---
 

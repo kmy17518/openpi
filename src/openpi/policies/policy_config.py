@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pathlib
@@ -8,6 +9,7 @@ import jax.numpy as jnp
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
+from openpi.training import b1k_artifacts
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
@@ -22,6 +24,8 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    b1k_metadata: dict[str, Any] | None = None,
+    max_token_len: int | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -44,6 +48,20 @@ def create_trained_policy(
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    if isinstance(train_config.data, _config.LeRobotB1KDataConfig):
+        data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+        if b1k_metadata is None:
+            b1k_metadata = b1k_artifacts.load_metadata(checkpoint_dir / "assets" / data_config.asset_id)
+        b1k_artifacts.validate_representation(
+            b1k_metadata,
+            data_config.action_representation,
+            allow_legacy_assets=data_config.allow_legacy_assets,
+            context="Policy checkpoint",
+        )
+        train_config = dataclasses.replace(
+            train_config,
+            model=b1k_artifacts.restore_model_config(train_config.model, b1k_metadata, max_token_len=max_token_len),
+        )
 
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")

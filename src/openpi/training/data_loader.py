@@ -1,11 +1,14 @@
+from collections import deque
 from collections.abc import Iterator, Sequence
+import contextlib
+import dataclasses
 import logging
 import multiprocessing
 import os
-import queue
 import threading
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +16,7 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.training.b1k_artifacts as _b1k_artifacts
 import openpi.training.b1k_dataset as _b1k_dataset
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
@@ -155,11 +159,10 @@ def create_b1k_dataset(
         dataset_meta = _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root)
         dataset_kwargs = {"repo_id": data_config.repo_id, **data_config.dataset_kwargs}
         if data_config.task_names:
-            subset = _b1k_dataset.select_task_subset(dataset_meta, data_config.task_names)
-            episodes = set(subset.episode_indices)
-            if (explicit := dataset_kwargs.get("episodes")) is not None:
-                episodes &= {int(ep) for ep in explicit}
-            dataset_kwargs["episodes"] = sorted(episodes)
+            subset = _b1k_dataset.select_task_subset(
+                dataset_meta, data_config.task_names, episodes=dataset_kwargs.get("episodes")
+            )
+            dataset_kwargs["episodes"] = list(subset.episode_indices)
             logging.info(
                 "Task subset %s (task_index %s): %d of %d episodes under %s",
                 list(subset.task_names),
@@ -176,8 +179,11 @@ def create_b1k_dataset(
         **dataset_kwargs,
     )
 
+    recorded_prompts = {}
     if data_config.prompt_from_task:
         if isinstance(data_config.repo_id, list):
+            if data_config.action_representation is not None:
+                raise NotImplementedError("Checkpoint prompt provenance requires a single BEHAVIOR dataset root")
             prompts = _lerobot_compat.tasks_from_metadata(dataset_meta)
         else:
             # Only the tasks actually trained on need a prompt: the selected subset, else every task on disk.
@@ -190,9 +196,19 @@ def create_b1k_dataset(
             logging.info(
                 "Prompting with %s, e.g. %r", data_config.prompt_source, prompts[min(required)] if required else None
             )
+            names = _b1k_dataset.task_names_by_index(dataset_meta.tasks)
+            recorded_prompts = {names[i]: prompts[i] for i in required}
             if model_config is not None:
-                _b1k_dataset.check_prompt_token_lengths({i: prompts[i] for i in required}, model_config)
+                representation = data_config.action_representation
+                state_dim = None if representation is None else sum(
+                    1 if group["is_eef"] else len(group["indices"]) for group in representation["proprio"]
+                )
+                _b1k_dataset.check_prompt_token_lengths(
+                    {i: prompts[i] for i in required}, model_config, state_dim=state_dim
+                )
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(prompts)])
+    if data_config.action_representation is not None and model_config is not None:
+        dataset.inference_metadata = _b1k_artifacts.inference_metadata(data_config, model_config, recorded_prompts)
 
     return dataset
 
@@ -256,6 +272,12 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(_missing_norm_stats_message(data_config))
+        _b1k_artifacts.validate_representation(
+            data_config.norm_stats_metadata,
+            data_config.action_representation,
+            allow_legacy_assets=data_config.allow_legacy_assets,
+            context=f"Normalization statistics for {data_config.asset_id}",
+        )
         norm_stats = data_config.norm_stats
 
     return TransformedDataset(
@@ -355,6 +377,7 @@ def create_b1k_data_loader(
     dataset = create_b1k_dataset(
         data_config=data_config, action_horizon=config.model.action_horizon, model_config=config.model
     )
+    data_config = dataclasses.replace(data_config, inference_metadata=getattr(dataset, "inference_metadata", None))
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(
@@ -493,7 +516,11 @@ def create_rlds_data_loader(
 
 
 class TorchDataLoader:
-    """Torch data loader implementation."""
+    """Torch data loader implementation.
+
+    Iterators retain persistent workers across epochs, then shut them down on exhaustion, failure, or explicit
+    iterator close. Close an abandoned iterator before iterating this loader again.
+    """
 
     def __init__(
         self,
@@ -577,24 +604,35 @@ class TorchDataLoader:
 
     def __iter__(self):
         num_items = 0
-        while True:
-            data_iter = iter(self._data_loader)
-            while True:
-                if self._num_batches is not None and num_items >= self._num_batches:
-                    return
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
-                num_items += 1
-                if self._micro_batches > 1:
-                    # [B, ...] -> [micro_batches, B / micro_batches, ...]; a view, the collated arrays are contiguous.
-                    batch = jax.tree.map(lambda x: x.reshape(self._micro_batches, -1, *x.shape[1:]), batch)
-                # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
-                if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
-                else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+        data_iter = None
+        try:
+            while self._num_batches is None or num_items < self._num_batches:
+                data_iter = iter(self._data_loader)
+                while self._num_batches is None or num_items < self._num_batches:
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        break  # We've exhausted the dataset. Create a new iterator and start over.
+                    num_items += 1
+                    if self._micro_batches > 1:
+                        # [B, ...] -> [micro_batches, B / micro_batches, ...]; a view of the collated arrays.
+                        batch = jax.tree.map(lambda x: x.reshape(self._micro_batches, -1, *x.shape[1:]), batch)
+                    # For JAX, convert to sharded arrays; for PyTorch, return torch tensors.
+                    if self._sharding is not None:
+                        yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                    else:
+                        yield jax.tree.map(torch.as_tensor, batch)
+        finally:
+            # PyTorch exposes no public shutdown API for persistent workers.
+            shutdown = getattr(data_iter, "_shutdown_workers", None)
+            try:
+                if shutdown is not None:
+                    shutdown()
+                elif (close := getattr(data_iter, "close", None)) is not None:
+                    close()
+            finally:
+                if getattr(self._data_loader, "_iterator", None) is data_iter:
+                    self._data_loader._iterator = None  # noqa: SLF001
 
 
 def _collate_fn(items):
@@ -656,40 +694,130 @@ class RLDSDataLoader:
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
-class PrefetchIterator(Iterator[T_co]):
-    """Pulls items from `iterator` in a background thread, keeping up to `depth` of them ready.
+class _PrefetchState:
+    def __init__(self, depth: int):
+        self.depth = max(depth, 1)
+        self.items = deque()
+        self.condition = threading.Condition()
+        self.stopped = False
+        self.finished = False
+        self.error: BaseException | None = None
 
-    Dispatching a jitted train step blocks the calling thread for most of the step on GPU (the host stays inside the
-    executable while its kernels are enqueued; only one or two steps run ahead), so the batch hand-off from the data
-    loader -- receiving the collated arrays from the worker process and putting them on the devices, ~0.05-0.5 s at
-    2048 samples, seconds when a worker is late -- would otherwise add directly to every step. Exceptions raised by
-    the iterator are re-raised from `__next__`.
+    def cancel(self) -> None:
+        with self.condition:
+            self.stopped = True
+            self.items.clear()
+            self.error = None
+            self.condition.notify_all()
+
+
+def _prefetch_worker(iterator: Iterator, state: _PrefetchState) -> None:
+    error = None
+    try:
+        while True:
+            with state.condition:
+                state.condition.wait_for(lambda: state.stopped or len(state.items) < state.depth)
+                if state.stopped:
+                    break
+            try:
+                item = next(iterator)
+            except StopIteration:
+                break
+            with state.condition:
+                if state.stopped:
+                    break
+                state.items.append(item)
+                state.condition.notify_all()
+            del item
+    except BaseException as exc:  # Forward producer failures, including worker-process failures, to the consumer.
+        error = exc
+    finally:
+        # Only the producer closes upstream: a consumer may cancel while next(iterator) is still executing.
+        try:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+            else:
+                logging.exception("Error closing failed prefetch iterator")
+        with state.condition:
+            if not state.stopped:
+                state.error = error
+            elif error is not None:
+                logging.warning("Prefetch iterator failed during cancellation", exc_info=error)
+            state.finished = True
+            state.condition.notify_all()
+
+
+class PrefetchIterator(Iterator[T_co]):
+    """Prefetch up to `depth` device batches, overlapping loading with the dispatched train step.
+
+    Use as a context manager or call `close()` when abandoning iteration, including after an early break. Exhaustion
+    and producer errors close upstream automatically; errors are raised once, then iteration stays exhausted. The
+    producer owns upstream cleanup, so cancellation never calls `close()` on an executing generator. Garbage
+    collection requests cancellation without waiting, but explicit close is needed for deterministic cleanup.
     """
 
     def __init__(self, iterator: Iterator[T_co], depth: int = 2):
-        self._queue: queue.Queue = queue.Queue(maxsize=max(depth, 1))
-        self._end = object()
-        self._thread = threading.Thread(target=self._run, args=(iterator,), name="batch-prefetch", daemon=True)
-        self._thread.start()
-
-    def _run(self, iterator: Iterator[T_co]) -> None:
+        self._state = _PrefetchState(depth)
+        # Neither the worker nor the finalizer retains this consumer iterator.
+        self._finalizer = weakref.finalize(self, self._state.cancel)
+        self._thread = threading.Thread(
+            target=_prefetch_worker, args=(iterator, self._state), name="batch-prefetch", daemon=True
+        )
         try:
-            for item in iterator:
-                self._queue.put(item)
-        except BaseException as e:  # forwarded to the consumer thread, re-raised there
-            self._queue.put(e)
-        self._queue.put(self._end)
+            self._thread.start()
+        except BaseException:
+            self._finalizer()
+            try:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
+            except BaseException:
+                logging.exception("Error closing iterator after prefetch thread startup failed")
+            raise
 
     def __iter__(self):
         return self
 
     def __next__(self) -> T_co:
-        item = self._queue.get()
-        if item is self._end:
-            raise StopIteration
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        state = self._state
+        with state.condition:
+            state.condition.wait_for(lambda: state.stopped or state.items or state.finished)
+            if state.stopped:
+                raise StopIteration
+            if state.items:
+                item = state.items.popleft()
+                state.condition.notify_all()
+                return item
+            error = state.error
+            state.error = None
+            state.stopped = True
+        if error is not None:
+            raise error
+        raise StopIteration
+
+    def close(self, timeout: float = 1.0) -> bool:
+        """Cancel, release queued batches, and wait at most `timeout` seconds for producer cleanup.
+
+        Return whether the producer has exited. If upstream `next()` or `close()` blocks, return False after the
+        timeout; the daemon producer will close upstream when that call returns. Python threads cannot safely be
+        forcibly stopped. Repeated calls can wait again. Waiting consumers are unblocked immediately.
+        """
+        if timeout < 0:
+            raise ValueError("timeout must be nonnegative")
+        self._finalizer()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
 
 class DataLoaderImpl(DataLoader):
@@ -701,5 +829,6 @@ class DataLoaderImpl(DataLoader):
         return self._data_config
 
     def __iter__(self):
-        for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+        with contextlib.closing(iter(self._data_loader)) as data_iter:
+            for batch in data_iter:
+                yield _model.Observation.from_dict(batch), batch["actions"]
