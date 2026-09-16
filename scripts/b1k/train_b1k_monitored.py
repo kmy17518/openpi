@@ -113,6 +113,10 @@ def main() -> None:
                 dataset_root=settings["dataset_root"],
                 task_names=("turning_on_radio",),
                 prompt_source="task_name",
+                base_config=dataclasses.replace(
+                    base.data.base_config,
+                    dataset_kwargs={**base.data.base_config.dataset_kwargs, "video_backend": "pyav"},
+                ),
             ),
             exp_name=settings["exp_name"],
             project_name=settings["wandb_project"],
