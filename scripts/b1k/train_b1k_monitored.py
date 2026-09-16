@@ -99,6 +99,7 @@ def main() -> None:
     import wandb
 
     from openpi.training import config as training_config
+    from openpi.training import weight_loaders
     from scripts.b1k import run_lifecycle
     from scripts.b1k import train_b1k
     from scripts.b1k.hf_single_writer_checkpoint_uploader import stage_local_checkpoint
@@ -112,6 +113,7 @@ def main() -> None:
         config = dataclasses.replace(
             base,
             model=model,
+            weight_loader=weight_loaders.CheckpointWeightLoader(settings["pretrained_params"]),
             data=dataclasses.replace(
                 base.data,
                 repo_id="behavior-1k/2026-challenge-demos",
