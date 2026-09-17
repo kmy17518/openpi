@@ -104,7 +104,15 @@ def main() -> None:
     from scripts.b1k import train_b1k
     from scripts.b1k.hf_single_writer_checkpoint_uploader import stage_local_checkpoint
 
-    observer = RunObserver(settings, stage_local_checkpoint)
+    if settings.get("hf_repo"):
+        stage = stage_local_checkpoint
+    else:
+        # No Hub publication for this run (hf_repo null): completed checkpoints stay in checkpoint_dir only, where
+        # max_to_keep applies; nothing is copied to a staging queue.
+        def stage(path, staging_root, step):
+            return None
+
+    observer = RunObserver(settings, stage)
     try:
         base = training_config.get_config("pi05_b1k")
         model = dataclasses.replace(

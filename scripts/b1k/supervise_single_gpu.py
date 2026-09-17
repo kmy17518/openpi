@@ -37,7 +37,11 @@ def stop(process, timeout: float = 30) -> None:
 
 
 def command_lines(settings: dict, config_path: Path):
+    """Trainer and publisher command lines; the publisher is None when the run config has no `hf_repo`."""
     python = settings["python"]
+    trainer = [python, "scripts/b1k/train_b1k_monitored.py", "--run-config", str(config_path)]
+    if not settings.get("hf_repo"):
+        return trainer, None
     publisher = [
         python,
         "scripts/b1k/hf_single_writer_checkpoint_uploader.py",
@@ -73,7 +77,6 @@ def command_lines(settings: dict, config_path: Path):
         "--poll-seconds",
         "30",
     ]
-    trainer = [python, "scripts/b1k/train_b1k_monitored.py", "--run-config", str(config_path)]
     return trainer, publisher
 
 
@@ -88,8 +91,12 @@ def main() -> int:
     if not allowed <= os.sched_getaffinity(0):
         raise ValueError("Unavailable CPU affinity")
     os.sched_setaffinity(0, allowed)
-    os.chdir(Path(__file__).resolve().parents[2])
+    repo = Path(__file__).resolve().parents[2]
+    os.chdir(repo)
     env = dict(os.environ)
+    # Import openpi from this checkout's sources even when the shared venv's editable install points at another
+    # checkout (this branch is meant to run from a git worktree next to the main one).
+    env["PYTHONPATH"] = os.pathsep.join([str(repo / "src"), *filter(None, [env.get("PYTHONPATH")])])
     env.update(
         CUDA_VISIBLE_DEVICES=str(settings["gpu"]),
         WANDB_MODE="online",
@@ -125,43 +132,50 @@ def main() -> int:
             Path(settings["uploader_log"]).open("a") as upload_log,
             Path(settings["training_log"]).open("a") as train_log,
         ):
-            initialized = subprocess.Popen(
-                [*publisher_cmd, "--init-only"],
-                env=env,
-                stdout=upload_log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            processes.append(initialized)
-            initialization_deadline = time.monotonic() + settings.get("initialization_timeout_seconds", 7200)
-            while initialized.poll() is None:
-                if stopped:
-                    raise RuntimeError("Cancelled during checkpoint recovery")
-                if time.monotonic() > initialization_deadline:
-                    raise RuntimeError("Checkpoint initialization/recovery exceeded its time budget")
-                atomic_json(status_path, {"state": "initializing", "pid": os.getpid(), "updated_at": time.time()})
-                time.sleep(5)
-            if initialized.returncode:
-                raise RuntimeError("Publisher ownership/storage initialization failed; trainer not started")
-            processes.remove(initialized)
-            uploader = subprocess.Popen(
-                publisher_cmd, env=env, stdout=upload_log, stderr=subprocess.STDOUT, start_new_session=True
-            )
-            processes.append(uploader)
+            uploader = None
+            if publisher_cmd is not None:
+                initialized = subprocess.Popen(
+                    [*publisher_cmd, "--init-only"],
+                    env=env,
+                    stdout=upload_log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                processes.append(initialized)
+                initialization_deadline = time.monotonic() + settings.get("initialization_timeout_seconds", 7200)
+                while initialized.poll() is None:
+                    if stopped:
+                        raise RuntimeError("Cancelled during checkpoint recovery")
+                    if time.monotonic() > initialization_deadline:
+                        raise RuntimeError("Checkpoint initialization/recovery exceeded its time budget")
+                    atomic_json(status_path, {"state": "initializing", "pid": os.getpid(), "updated_at": time.time()})
+                    time.sleep(5)
+                if initialized.returncode:
+                    raise RuntimeError("Publisher ownership/storage initialization failed; trainer not started")
+                processes.remove(initialized)
+                uploader = subprocess.Popen(
+                    publisher_cmd, env=env, stdout=upload_log, stderr=subprocess.STDOUT, start_new_session=True
+                )
+                processes.append(uploader)
+            else:
+                # hf_repo is null: no checkpoint publisher; the trainer alone decides completion.
+                upload_log.write("No hf_repo in the run config: checkpoint publication disabled for this run.\n")
+                upload_log.flush()
             trainer = subprocess.Popen(
                 trainer_cmd, env=env, stdout=train_log, stderr=subprocess.STDOUT, start_new_session=True
             )
             processes.append(trainer)
             trainer_finished = None
             while not stopped:
-                tcode, ucode = trainer.poll(), uploader.poll()
+                tcode = trainer.poll()
+                ucode = uploader.poll() if uploader is not None else None
                 atomic_json(
                     status_path,
                     {
                         "state": "running",
                         "pid": os.getpid(),
                         "trainer_pid": trainer.pid,
-                        "uploader_pid": uploader.pid,
+                        "uploader_pid": uploader.pid if uploader is not None else None,
                         "trainer_exit": tcode,
                         "uploader_exit": ucode,
                         "started_at": started,
@@ -170,10 +184,10 @@ def main() -> int:
                 )
                 if tcode not in (None, 0) or ucode not in (None, 0):
                     raise RuntimeError(f"Required process failed: trainer={tcode}, publisher={ucode}")
-                if tcode == 0 and ucode == 0:
+                if tcode == 0 and (uploader is None or ucode == 0):
                     atomic_json(status_path, {"state": "completed", "updated_at": time.time()})
                     return 0
-                if ucode == 0 and tcode is None:
+                if uploader is not None and ucode == 0 and tcode is None:
                     status = json.loads((Path(settings["staging_dir"]) / "status.json").read_text())
                     if not status.get("done") or status.get("latest_full_step") != settings["max_steps"]:
                         raise RuntimeError("Publisher exited before verifying the final checkpoint")
