@@ -443,9 +443,6 @@ class _B1KDatasetReader(DatasetReader):
             self._meta = _CameraFilteredMetadata(self._meta, self._video_keys)
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
-        if self._video_backend == "pyav" and quiet_pyav_logging():
-            # Once per process (data-loader workers included): see quiet_pyav_logging.
-            logging.info("Disabled PyAV's Python log forwarding for the pyav video backend")
         if self._video_keys is not None:
             query_timestamps = {key: ts for key, ts in query_timestamps.items() if key in self._video_keys}
         return super()._query_videos(query_timestamps, ep_idx)
@@ -524,25 +521,6 @@ def default_video_backend() -> str:
             )
             return "pyav"
     return backend
-
-
-def quiet_pyav_logging() -> bool:
-    """Drop FFmpeg's log messages inside PyAV instead of forwarding them to Python. Returns True if it changed.
-
-    ``torchvision.io`` (imported by lerobot) calls ``av.logging.set_level(av.logging.ERROR)`` at import time. That
-    installs PyAV's Python log callback, which acquires the GIL for *every* FFmpeg log call -- including the tens of
-    thousands of TRACE-level atom messages libavformat emits while parsing an mp4 header -- so with the ``pyav``
-    backend every ``av.open`` in the reader's per-camera decode threads takes seconds instead of milliseconds
-    (measured here: 6 concurrent opens 6 ms -> 2.3 s; a sample 0.1 s -> 3.8 s). PyAV's default is to ignore FFmpeg
-    logs entirely (``set_level(None)`` installs a no-op C callback); restore that. Only PyAV's error-message
-    bookkeeping is lost. Must run in every process that decodes (data-loader workers re-import torchvision).
-    """
-    import av.logging
-
-    if av.logging.get_level() is None:
-        return False
-    av.logging.set_level(None)
-    return True
 
 
 def _check_files_exist(root: pathlib.Path, files: Sequence[pathlib.Path], what: str) -> None:

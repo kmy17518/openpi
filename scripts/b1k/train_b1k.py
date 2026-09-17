@@ -495,9 +495,10 @@ def main(config: _config.TrainConfig, *, observer=None):
                 observer.update("resuming", step=int(train_state.step))
                 observer.reconcile_checkpoints(config.checkpoint_dir, checkpoint_manager.all_steps())
 
-        if config.prefetch_batches > 0:
-            # Workers start on the main thread above; only the prefetch producer owns upstream from here on.
-            data_iter = _data_loader.PrefetchIterator(data_iter, depth=config.prefetch_batches)
+        # No-perf baseline: batches are fetched synchronously on the main thread after each step (no background
+        # `PrefetchIterator`), as the original trainer did. `config.prefetch_batches` is ignored here.
+        if config.prefetch_batches:
+            logging.warning("prefetch_batches=%d ignored: this branch does not prefetch batches", config.prefetch_batches)
 
         ptrain_step = jax.jit(
             functools.partial(train_step, config),
@@ -551,10 +552,7 @@ def main(config: _config.TrainConfig, *, observer=None):
     finally:
         try:
             close = getattr(data_iter, "close", None)
-            if isinstance(data_iter, _data_loader.PrefetchIterator):
-                if not data_iter.close(timeout=60):
-                    raise RuntimeError("Data-loader producer did not finish cleanup within60 seconds")
-            elif close is not None:
+            if close is not None:
                 close()
         finally:
             checkpoint_manager.close()
