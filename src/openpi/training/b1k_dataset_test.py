@@ -5,9 +5,11 @@ The synthetic dataset mimics the challenge demos' layout -- one chunk per task, 
 real 3 TB dataset.
 """
 
+import dataclasses
 import json
 import pathlib
 import pickle
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -169,6 +171,102 @@ def test_select_task_subset(full_root: pathlib.Path, partial_root: pathlib.Path)
         b1k_dataset.select_task_subset(partial, "turning_on_radio")
 
 
+@pytest.mark.parametrize("with_task_index", [True, False])
+def test_subset_requires_every_requested_task(partial_root: pathlib.Path, *, with_task_index: bool):
+    meta = b1k_dataset.B1KDatasetMetadata("org/demos", partial_root)
+    if not with_task_index:
+        meta.episodes = meta.episodes.remove_columns("task_index")
+    with pytest.raises(ValueError, match="No episodes of task") as error:
+        b1k_dataset.select_task_subset(meta, TASKS)
+    message = str(error.value)
+    assert "No episodes of task(s) ['chop_an_onion', 'turning_on_radio']" in message
+    assert "task_index [0, 2]" in message
+    assert str(partial_root) in message
+
+
+@pytest.mark.parametrize("with_task_index", [True, False])
+def test_subset_accepts_task_aliases(full_root: pathlib.Path, *, with_task_index: bool):
+    meta = b1k_dataset.B1KDatasetMetadata("org/demos", full_root)
+    meta.tasks.loc["radio_alias", "task_index"] = 0
+    if not with_task_index:
+        meta.episodes = meta.episodes.remove_columns("task_index")
+    subset = b1k_dataset.select_task_subset(meta, ["radio_alias", "turning_on_radio", "picking_up_trash"])
+    assert subset.task_indices == frozenset({0, 1})
+    assert subset.episode_indices == (0, 1, 2, 3)
+
+
+def test_partial_task_subset_fails_before_reader(partial_root: pathlib.Path, monkeypatch):
+    reader = mock.Mock(side_effect=AssertionError("reader must not be constructed"))
+    monkeypatch.setattr(b1k_dataset, "_B1KDatasetReader", reader)
+    with pytest.raises(ValueError, match="No episodes of task"):
+        b1k_dataset.B1KLeRobotDataset("org/demos", partial_root, task_names=TASKS)
+    reader.assert_not_called()
+
+
+def test_partial_task_subset_fails_before_stats_dataset(partial_root: pathlib.Path, monkeypatch):
+    from openpi.training import config
+    from scripts import compute_norm_stats
+
+    reader = mock.Mock(side_effect=AssertionError("stats dataset must not be constructed"))
+    monkeypatch.setattr(compute_norm_stats._lerobot_lowdim, "LowDimLeRobotDataset", reader)  # noqa: SLF001
+    data_config = config.DataConfig(repo_id="org/demos", dataset_root=str(partial_root), task_names=TASKS)
+    with pytest.raises(ValueError, match="No episodes of task"):
+        compute_norm_stats._create_lowdim_dataset(data_config, HORIZON)  # noqa: SLF001
+    reader.assert_not_called()
+
+
+@pytest.mark.parametrize("fast", [True, False])
+def test_partial_task_subset_never_writes_stats(partial_root: pathlib.Path, monkeypatch, *, fast: bool):
+    from openpi.training import config
+    from scripts import compute_norm_stats
+
+    data_config = config.DataConfig(repo_id="org/demos", dataset_root=str(partial_root), task_names=TASKS)
+    factory = config.LeRobotB1KDataConfig()
+    monkeypatch.setattr(config.LeRobotB1KDataConfig, "create", lambda *_args: data_config)
+    save = mock.Mock(side_effect=AssertionError("stats must not be written"))
+    monkeypatch.setattr(compute_norm_stats.normalize, "save", save)
+    args = compute_norm_stats.Args(config_name="pi05_b1k", data=factory, fast=fast)
+    with pytest.raises(ValueError, match="No episodes of task"):
+        compute_norm_stats.main(args)
+    save.assert_not_called()
+
+
+@pytest.mark.parametrize("with_task_index", [True, False])
+def test_explicit_episode_subset_requires_every_task(full_root: pathlib.Path, *, with_task_index: bool):
+    meta = b1k_dataset.B1KDatasetMetadata("org/demos", full_root)
+    if not with_task_index:
+        meta.episodes = meta.episodes.remove_columns("task_index")
+    with pytest.raises(ValueError, match="picking_up_trash.*task_index \\[1\\].*requested episode selection"):
+        b1k_dataset.select_task_subset(meta, TASKS[:2], episodes=[0, 1])
+    assert b1k_dataset.select_task_subset(meta, TASKS[:2], episodes=[0, 2]).episode_indices == (0, 2)
+
+
+def test_dataset_explicit_episodes_cannot_drop_requested_tasks(full_root: pathlib.Path):
+    with pytest.raises(ValueError, match="picking_up_trash.*requested episode selection"):
+        b1k_dataset.B1KLeRobotDataset("org/demos", full_root, task_names=TASKS[:2], episodes=[0, 1])
+
+
+@pytest.mark.parametrize("entrypoint", ["training", "stats"])
+def test_explicit_episode_selection_checked_before_dataset(full_root: pathlib.Path, monkeypatch, entrypoint: str):
+    from openpi.training import config
+    from openpi.training import data_loader
+    from scripts import compute_norm_stats
+
+    reader = mock.Mock(side_effect=AssertionError("dataset must not be constructed"))
+    data_config = config.DataConfig(
+        repo_id="org/demos", dataset_root=str(full_root), task_names=TASKS[:2], dataset_kwargs={"episodes": [0, 1]}
+    )
+    if entrypoint == "training":
+        create = data_loader.create_b1k_dataset
+        data_config = dataclasses.replace(data_config, data_cls=reader)
+    else:
+        monkeypatch.setattr(compute_norm_stats._lerobot_lowdim, "LowDimLeRobotDataset", reader)  # noqa: SLF001
+        create = compute_norm_stats._create_lowdim_dataset  # noqa: SLF001
+    with pytest.raises(ValueError, match="picking_up_trash.*requested episode selection"):
+        create(data_config, HORIZON)
+    reader.assert_not_called()
+
+
 def _episode_indices(ds: b1k_dataset.B1KLeRobotDataset) -> set[int]:
     return {int(ds[i]["episode_index"]) for i in range(len(ds))}
 
@@ -312,6 +410,19 @@ def test_check_prompt_token_lengths():
     b1k_dataset.check_prompt_token_lengths(short, pi0)
     with pytest.raises(ValueError, match="exceed max_token_len=48 and would be truncated"):
         b1k_dataset.check_prompt_token_lengths({2: long_prompt}, pi0)
+
+
+def test_prompt_length_check_uses_extracted_state_dimension(monkeypatch):
+    from openpi.models import pi0_config
+    from openpi.models import tokenizer
+
+    tokenize = mock.Mock(side_effect=lambda _prompt, state: (None, np.ones(len(state), dtype=bool)))
+    monkeypatch.setattr(tokenizer, "PaligemmaTokenizer", lambda **_kwargs: mock.Mock(tokenize=tokenize))
+    model = pi0_config.Pi0Config(pi05=True, action_dim=32, max_token_len=23)
+    b1k_dataset.check_prompt_token_lengths({0: "instruction"}, model, state_dim=23)
+    assert tokenize.call_args.kwargs["state"].shape == (23,)
+    with pytest.raises(ValueError, match="32 tokens"):
+        b1k_dataset.check_prompt_token_lengths({0: "instruction"}, model)
 
 
 def test_prompt_source_record_round_trip(tmp_path: pathlib.Path):
