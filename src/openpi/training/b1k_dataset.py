@@ -130,39 +130,49 @@ def select_task_indices(tasks: Any, task_names: Iterable[str]) -> frozenset[int]
     return frozenset(selected)
 
 
-def select_task_subset(meta: LeRobotDatasetMetadata, task_names: str | Iterable[str]) -> TaskSubset:
-    """Resolve ``task_names`` against a dataset root's ``meta/`` (works on a partial download).
+def select_task_subset(
+    meta: LeRobotDatasetMetadata,
+    task_names: str | Iterable[str],
+    *,
+    episodes: Iterable[int] | None = None,
+) -> TaskSubset:
+    """Select episodes, requiring coverage of every requested task on this local root.
 
-    Episodes are matched on their ``task_index`` when the episode metadata carries it (the challenge demos
-    do), else on LeRobot's per-episode ``tasks`` strings. Raises ``ValueError`` for an unknown name or when
-    no episode on disk belongs to the selected tasks (e.g. a partial download of *other* tasks).
+    Match ``task_index`` when present, otherwise resolve episode task strings through ``meta/tasks.parquet``.
+    ``episodes`` optionally restricts the available episodes before checking task coverage. Raises ``ValueError``
+    for an unknown name or when any selected task has no episode on disk (e.g. a partial download of *other*
+    tasks) -- a requested task is never silently omitted.
     """
     names = normalize_task_names(task_names)
     if names is None:
         raise ValueError("select_task_subset needs at least one task name")
     task_indices = select_task_indices(meta.tasks, names)
-    episodes = meta.episodes
-    episode_indices = _column(episodes, "episode_index")
-    if "task_index" in episodes.column_names:
-        episode_tasks = [int(task) for task in _column(episodes, "task_index")]
-        selected = [int(ep) for ep, task in zip(episode_indices, episode_tasks, strict=True) if task in task_indices]
-        on_disk = f"task_index {sorted(set(episode_tasks))}"
+    by_name: dict[str, set[int]] = {}
+    for name, index in zip(meta.tasks.index, meta.tasks["task_index"], strict=True):
+        by_name.setdefault(str(name), set()).add(int(index))
+    episode_indices = _column(meta.episodes, "episode_index")
+    if "task_index" in meta.episodes.column_names:
+        episode_tasks = [{int(task)} for task in _column(meta.episodes, "task_index")]
     else:
-        task_strings = {
-            str(task_str)
-            for task_str, idx in zip(meta.tasks.index, meta.tasks["task_index"], strict=True)
-            if int(idx) in task_indices
-        }
-        selected = [
-            int(ep)
-            for ep, tasks in zip(episode_indices, _column(episodes, "tasks"), strict=True)
-            if task_strings & {str(t) for t in (tasks or ())}
+        episode_tasks = [
+            {index for task in (tasks or ()) for index in by_name.get(str(task), ())}
+            for tasks in _column(meta.episodes, "tasks")
         ]
-        on_disk = "other tasks"
-    if not selected:
+    allowed = None if episodes is None else {int(ep) for ep in episodes}
+    selected = []
+    available: set[int] = set()
+    for ep, tasks in zip(episode_indices, episode_tasks, strict=True):
+        if allowed is not None and int(ep) not in allowed:
+            continue
+        available.update(tasks)
+        if tasks & task_indices:
+            selected.append(int(ep))
+    if missing := task_indices - available:
+        missing_names = [name for name in names if by_name[name] & missing]
+        selection = "" if allowed is None else " within the requested episode selection"
         raise ValueError(
-            f"No episodes of task(s) {list(names)} (task_index {sorted(task_indices)}) in {meta.root}: the "
-            f"{len(episode_indices)} episodes on disk belong to {on_disk} -- is this a partial download of other tasks?"
+            f"No episodes of task(s) {missing_names} (task_index {sorted(missing)}) in {meta.root}{selection}: the "
+            f"available episodes belong to task_index {sorted(available)} -- is this a partial download of other tasks?"
         )
     return TaskSubset(task_names=names, task_indices=task_indices, episode_indices=tuple(sorted(selected)))
 
@@ -242,14 +252,17 @@ def task_prompts(
     return {task_index: descriptions[task_index] for task_index in names if task_index in descriptions}
 
 
-def check_prompt_token_lengths(prompts: dict[int, str], model_config: Any) -> None:
+def check_prompt_token_lengths(prompts: dict[int, str], model_config: Any, state_dim: int | None = None) -> None:
     """Fail fast if a prompt cannot fit ``model_config.max_token_len`` (PaliGemma-tokenized pi0 / pi05 models).
 
     ``PaligemmaTokenizer`` truncates over-long prompts from the end -- for pi05, whose prompt is
     ``Task: <text>, State: <discretized state>;\\nAction:``, that drops state digits and the ``Action:`` marker, so
     the policy would silently lose its proprioception on those tasks. The challenge demos' task descriptions run
-    up to ~105 tokens, which next to a 32-dim state does not always fit the default ``max_token_len=200``. The
-    state is assumed worst case (every dimension a 3-digit bin).
+    up to ~105 tokens, which next to the state does not always fit the default ``max_token_len=200``. The
+    state is assumed worst case (every dimension a 3-digit bin). ``state_dim`` is the extracted state length
+    before model padding (23 for R1Pro): pi05 tokenizes the prompt *before* ``PadStatesAndActions``, so counting
+    the model's padded ``action_dim`` (32) would over-estimate the prompt by ~36 tokens. If omitted, use the model's
+    action dimension.
     """
     model_type = getattr(model_config, "model_type", None)
     if model_type is None or model_type.value not in ("pi0", "pi05"):
@@ -258,7 +271,8 @@ def check_prompt_token_lengths(prompts: dict[int, str], model_config: Any) -> No
 
     max_len = int(model_config.max_token_len)
     tokenizer = _tokenizer.PaligemmaTokenizer(max_len=max(8 * max_len, 4096))  # long enough to never truncate
-    state = np.full(int(model_config.action_dim), 1.0) if getattr(model_config, "discrete_state_input", False) else None
+    state_dim = int(model_config.action_dim) if state_dim is None else int(state_dim)
+    state = np.full(state_dim, 1.0) if getattr(model_config, "discrete_state_input", False) else None
     too_long: dict[int, tuple[str, int]] = {}
     for task_index, prompt in prompts.items():
         length = int(tokenizer.tokenize(prompt, state=state)[1].sum())
@@ -535,6 +549,9 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
                 raise ValueError(
                     f"No episode of task(s) {list(self.task_names or ())} among episodes {requested[:10]}..."
                 )
+            if self.task_subset is not None:
+                # Every requested task must still be covered after the explicit episode filter.
+                self.task_subset = select_task_subset(self.meta, self.task_names, episodes=selected)
         self.episodes = selected
 
         data_files, video_files = _referenced_files(self.meta, self.episodes)

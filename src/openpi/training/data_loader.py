@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.training.b1k_artifacts as _b1k_artifacts
 import openpi.training.b1k_dataset as _b1k_dataset
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
@@ -153,11 +155,11 @@ def create_b1k_dataset(
         dataset_meta = _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root)
         dataset_kwargs = {"repo_id": data_config.repo_id, **data_config.dataset_kwargs}
         if data_config.task_names:
-            subset = _b1k_dataset.select_task_subset(dataset_meta, data_config.task_names)
-            episodes = set(subset.episode_indices)
-            if (explicit := dataset_kwargs.get("episodes")) is not None:
-                episodes &= {int(ep) for ep in explicit}
-            dataset_kwargs["episodes"] = sorted(episodes)
+            # Every requested task must have episodes, also within an explicit `episodes` selection.
+            subset = _b1k_dataset.select_task_subset(
+                dataset_meta, data_config.task_names, episodes=dataset_kwargs.get("episodes")
+            )
+            dataset_kwargs["episodes"] = list(subset.episode_indices)
             logging.info(
                 "Task subset %s (task_index %s): %d of %d episodes under %s",
                 list(subset.task_names),
@@ -174,8 +176,11 @@ def create_b1k_dataset(
         **dataset_kwargs,
     )
 
+    recorded_prompts: dict[str, str] = {}
     if data_config.prompt_from_task:
         if isinstance(data_config.repo_id, list):
+            if data_config.action_representation is not None:
+                raise NotImplementedError("Checkpoint prompt provenance requires a single BEHAVIOR dataset root")
             prompts = _lerobot_compat.tasks_from_metadata(dataset_meta)
         else:
             # Only the tasks actually trained on need a prompt: the selected subset, else every task on disk.
@@ -188,9 +193,23 @@ def create_b1k_dataset(
             logging.info(
                 "Prompting with %s, e.g. %r", data_config.prompt_source, prompts[min(required)] if required else None
             )
+            names = _b1k_dataset.task_names_by_index(dataset_meta.tasks)
+            recorded_prompts = {names[i]: prompts[i] for i in required}
             if model_config is not None:
-                _b1k_dataset.check_prompt_token_lengths({i: prompts[i] for i in required}, model_config)
+                # The prompt is tokenized with the extracted (unpadded) state; count that, not the model's action_dim.
+                representation = data_config.action_representation
+                state_dim = (
+                    None
+                    if representation is None
+                    else sum(1 if group["is_eef"] else len(group["indices"]) for group in representation["proprio"])
+                )
+                _b1k_dataset.check_prompt_token_lengths(
+                    {i: prompts[i] for i in required}, model_config, state_dim=state_dim
+                )
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(prompts)])
+    if data_config.action_representation is not None and model_config is not None:
+        # Recorded into new checkpoints (`b1k_metadata.json`) so serving restores the exact prompts and model settings.
+        dataset.inference_metadata = _b1k_artifacts.inference_metadata(data_config, model_config, recorded_prompts)
 
     return dataset
 
@@ -254,6 +273,12 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(_missing_norm_stats_message(data_config))
+        _b1k_artifacts.validate_representation(
+            data_config.norm_stats_metadata,
+            data_config.action_representation,
+            allow_legacy_assets=data_config.allow_legacy_assets,
+            context=f"Normalization statistics for {data_config.asset_id}",
+        )
         norm_stats = data_config.norm_stats
 
     return TransformedDataset(
@@ -353,6 +378,7 @@ def create_b1k_data_loader(
     dataset = create_b1k_dataset(
         data_config=data_config, action_horizon=config.model.action_horizon, model_config=config.model
     )
+    data_config = dataclasses.replace(data_config, inference_metadata=getattr(dataset, "inference_metadata", None))
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(

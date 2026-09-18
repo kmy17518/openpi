@@ -74,17 +74,23 @@ class B1KPolicyWrapper:
         """
         Process the input dictionary to match the expected input format for the model.
         """
-        prop_state = obs[f"{self.robot.name}::proprio"]
+        prop_state = np.asarray(obs[f"{self.robot.name}::proprio"])
         if prop_state.ndim == 1:
             prop_state = prop_state[None, :]  # Add batch dimension
+        if prop_state.ndim != 2 or prop_state.shape[0] == 0:
+            raise ValueError("Proprioception must have shape (D,) or (B, D) with B > 0")
         batch_size = prop_state.shape[0]
         # Process camera images from robot config
         observations = []
         for camera_key in sorted(self.robot.observations.keys()):
-            camera_obs = obs[self.robot.observations[camera_key].obs_key][..., :3]
+            camera_obs = np.asarray(obs[self.robot.observations[camera_key].obs_key])
+            if camera_obs.ndim not in (3, 4) or camera_obs.shape[-1] < 3:
+                raise ValueError(f"Camera {camera_key!r} must have shape (H, W, C) or (B, H, W, C)")
             if camera_obs.ndim == 3:
                 camera_obs = camera_obs[None, ...]  # Add batch dimension
-            observations.append(resize_with_pad(camera_obs, *self.obs_size))
+            if camera_obs.shape[0] != batch_size:
+                raise ValueError(f"Camera {camera_key!r} batch size does not match proprioception")
+            observations.append(resize_with_pad(camera_obs[..., :3], *self.obs_size))
 
         # Pad with zeros if we have fewer than 3 cameras (expected by model)
         while len(observations) < 3:
@@ -119,6 +125,33 @@ class B1KPolicyWrapper:
         seq_idx = seq_range[None, :, None]
         pos_idx = safe_indices[:, :, None]
         return self.action_buffer[batch_idx, seq_idx, pos_idx].squeeze(-2)
+
+    @property
+    def prediction_horizon(self) -> int:
+        return self.max_len
+
+    def act_chunk(self, input_obs):
+        """Predict once from fresh observations and return the execution prefix."""
+        if self.control_mode != "receding_horizon":
+            raise ValueError("Action chunks require receding_horizon control")
+        if not 1 <= self.action_horizon <= self.prediction_horizon:
+            raise ValueError("Require 1 <= action_horizon <= prediction_horizon")
+        batched = np.asarray(input_obs[f"{self.robot.name}::proprio"]).ndim == 2
+        input_batch = self.process_input(input_obs)
+        if not input_batch:
+            raise ValueError("An action request must contain at least one environment")
+        results = self.policy.infer_batch(input_batch)
+        if len(results) != len(input_batch):
+            raise ValueError("Policy returned a different batch size from the observations")
+        actions = np.stack([np.asarray(result["actions"]) for result in results])
+        if actions.shape != (len(input_batch), self.prediction_horizon, self.robot.action_dim):
+            raise ValueError(
+                f"Expected actions (batch, {self.prediction_horizon}, {self.robot.action_dim}), got {actions.shape}"
+            )
+        if actions.dtype.kind not in "fiu" or not np.isfinite(actions).all():
+            raise ValueError("Policy returned non-finite or non-numeric actions")
+        chunk = actions[:, : self.action_horizon].copy()
+        return torch.from_numpy(chunk if batched else chunk[0])
 
     def act_receding_horizon(self, input_obs):
         """

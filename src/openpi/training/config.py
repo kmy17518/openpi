@@ -24,6 +24,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.training.b1k_artifacts as _b1k_artifacts
 import openpi.training.b1k_dataset as _b1k_dataset
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.lerobot_compat as _lerobot_compat
@@ -119,6 +120,15 @@ class DataConfig:
     # behavior), or "task_description" -- the natural-language instruction from the dataset's `meta/tasks.jsonl`
     # (fallback: `configs/tasks/b1k.py`). Recorded in the checkpoint assets so serve_b1k.py prompts the same way.
     prompt_source: _b1k_dataset.PromptSource = _b1k_dataset.DEFAULT_PROMPT_SOURCE
+    # Robot/action conventions and their saved statistics/checkpoint provenance (`b1k_metadata.json`, see
+    # openpi.training.b1k_artifacts): the convention this run uses, the one recorded next to the norm stats it loaded,
+    # and the resolved prompts / model settings recorded into new checkpoints.
+    action_representation: dict[str, Any] | None = None
+    norm_stats_metadata: dict[str, Any] | None = None
+    inference_metadata: dict[str, Any] | None = None
+    # Permit norm stats / checkpoints without `b1k_metadata.json` (computed before it existed). A recorded mismatch is
+    # never bypassed.
+    allow_legacy_assets: bool = False
 
 
 class GroupFactory(Protocol):
@@ -393,8 +403,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     dataset_root: str | None = None
     # Train only on these tasks (task strings as in `meta/tasks.parquet`, e.g. `turning_on_radio`); default: every
     # task under `dataset_root`. Only the selected tasks' episodes are loaded and their norm stats are computed over
-    # those episodes alone, under the asset id `<repo_id>/task_subsets/<key>`. Unknown names, or a root that holds
-    # none of the selected tasks (a partial download of other tasks), fail fast. Overrides `base_config.task_names`.
+    # those episodes alone, under the asset id `<repo_id>/task_subsets/<key>`. Unknown names, or a root missing
+    # episodes for any selected task (a partial download of other tasks), fail fast. Overrides `base_config.task_names`.
     # CLI: --data.task-names TASK [TASK ...]
     task_names: Sequence[str] | None = None
     # Text the policy is prompted with: `task_name` (the snake_case task id from `meta/tasks.parquet`, e.g.
@@ -403,6 +413,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # checkpoint so `serve_b1k.py` prompts with the same kind of text. Overrides `base_config.prompt_source`.
     # CLI: --data.prompt-source task_description
     prompt_source: _b1k_dataset.PromptSource | None = None
+    # Permit unversioned norm stats / checkpoints (no `b1k_metadata.json`) only after checking their robot/action
+    # convention yourself; a recorded mismatch is never bypassed. CLI: --data.allow-legacy-assets
+    allow_legacy_assets: bool = False
 
     @override
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -417,6 +430,11 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         if asset_id is None and repo_id is not None:
             # A task subset has its own norm stats: `<repo_id>/task_subsets/<key>` (`<repo_id>` for the whole dataset).
             asset_id = repo_id if isinstance(repo_id, list) else _b1k_dataset.task_subset_asset_id(repo_id, task_names)
+        assets_dir = epath.Path(self.assets.assets_dir or assets_dirs)
+        metadata_asset_id = next(iter(asset_id), None) if isinstance(asset_id, list) else asset_id
+        norm_stats_metadata = (
+            _b1k_artifacts.load_metadata(assets_dir / metadata_asset_id) if metadata_asset_id is not None else None
+        )
         return dataclasses.replace(
             base_config,
             repo_id=repo_id,
@@ -424,7 +442,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             dataset_root=dataset_root,
             task_names=task_names,
             prompt_source=prompt_source,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=self._load_norm_stats(assets_dir, asset_id),
+            norm_stats_metadata=norm_stats_metadata,
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -498,6 +517,10 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            action_representation=_b1k_artifacts.action_representation(
+                robot_config, extra_delta_transform=self.extra_delta_transform
+            ),
+            allow_legacy_assets=self.allow_legacy_assets,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
