@@ -248,6 +248,14 @@ uv run scripts/b1k/train_b1k.py <CONFIG_NAME> \
 
 `--data.task-names <TASK_NAME>` restricts training to that task whether `<DATASET_ROOT>` is a per-task partial download or the full 100-task root (see [above](#which-demos-are-on-disk-one-task-or-all-100)); drop it to train on every task under the root. Use the same `--data.*` flags as for `compute_norm_stats.py` so training finds the matching statistics. The flag spelling here is `--data.dataset-root`; the challenge docs' `--data.base_config.dataset_root` is *not* accepted at this commit.
 
+`scripts/b1k/launch.sh` wraps all of the above for a single-GPU run on such a host — environment variables (`XLA_FLAGS`, `HOME` redirect, `CUDA_VISIBLE_DEVICES`, W&B server/entity, thread caps), `taskset` to a CPU quota and the flags below; every setting is an environment variable (`BATCH_SIZE`, `NUM_WORKERS`, `EXP_NAME`, `GPU`, `CPUS`, `WANDB_RUN_ID`, ... see its header), extra arguments go to `train_b1k.py` (e.g. `--resume`). Defaults are batch 512 with 16 workers on GPU 1 / CPUs 30–59:
+
+```bash
+EXP_NAME=<EXP_NAME> WANDB_RUN_ID=<RUN_ID> scripts/b1k/launch.sh            # fresh run
+EXP_NAME=<EXP_NAME> scripts/b1k/launch.sh --resume                          # continue it
+tmux new-session -d -s pi-radio 'bash scripts/b1k/launch.sh; exec bash'     # detached
+```
+
 Single-GPU example with the settings of the `my` branch's `turning_on_radio` run (batch 576 fits in the 284 GB of a B300 with ~264 GiB in use; the token budget 112 is valid for `task_name` prompts, see [Language prompt](#language-prompt)):
 
 ```bash
