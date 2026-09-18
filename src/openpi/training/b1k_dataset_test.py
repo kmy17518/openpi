@@ -440,3 +440,132 @@ def test_dataset_missing_data_file_fails_fast(full_root: pathlib.Path):
         b1k_dataset.B1KLeRobotDataset("org/demos", full_root, task_names="chop_an_onion")
     # Other tasks are unaffected: only the selected episodes' files are needed.
     assert len(b1k_dataset.B1KLeRobotDataset("org/demos", full_root, task_names="turning_on_radio")) > 0
+
+
+# ---- video decoding -----------------------------------------------------------------------------------------------
+
+VIDEO_FRAMES = 40
+
+
+def _write_test_video(path: pathlib.Path, *, seed: int, fps: int = FPS, gop: int = 4) -> None:
+    """A short inter-coded video (H.264, GOP ``gop``, no B-frames -- the challenge demos' structure) with a distinct
+    picture per frame, so that picking a wrong frame is detectable."""
+    import av
+
+    rng = np.random.default_rng(seed)
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("libx264", rate=fps)
+        stream.width = stream.height = 64
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"g": str(gop), "bf": "0", "crf": "18"}
+        for i in range(VIDEO_FRAMES):
+            picture = rng.integers(0, 256, size=(64, 64, 3), dtype=np.uint8)
+            picture[:16, :, :] = i * 6  # frame-number bar
+            frame = av.VideoFrame.from_ndarray(picture, format="rgb24")  # pts assigned by PyAV: frame i at i / fps
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+
+
+def test_video_frame_reader_matches_lerobot_decoder(tmp_path: pathlib.Path):
+    from lerobot.datasets import video_utils
+
+    path = tmp_path / "cam.mp4"
+    _write_test_video(path, seed=0)
+    reader = b1k_dataset.VideoFrameReader(max_open_files=4)
+    rng = np.random.default_rng(1)
+    for _ in range(12):
+        frames = sorted(rng.choice(VIDEO_FRAMES, size=rng.integers(1, 4), replace=False).tolist())
+        timestamps = [f / FPS for f in frames]
+        ours = reader.read(path, timestamps, tolerance_s=1e-4)
+        theirs = video_utils.decode_video_frames_pyav(path, timestamps, tolerance_s=1e-4, return_uint8=True)
+        assert ours.dtype == np.uint8
+        assert ours.shape == (len(frames), 64, 64, 3)
+        np.testing.assert_array_equal(ours, theirs.permute(0, 2, 3, 1).numpy())
+        # The frame-number bar identifies the picture: no off-by-one frame from the seek.
+        assert [round(float(pic[0, 0, 0]) / 6) for pic in ours] == frames
+    assert list(reader._containers) == [str(path)]  # noqa: SLF001  -- one long-lived container per file
+    # Out-of-tolerance requests are rejected like lerobot rejects them.
+    with pytest.raises(ValueError, match="tolerance"):
+        reader.read(path, [0.5 / FPS], tolerance_s=1e-4)
+    reader.close()
+
+
+def test_video_frame_reader_lru_and_pickling(tmp_path: pathlib.Path):
+    paths = [tmp_path / f"cam{i}.mp4" for i in range(3)]
+    for i, path in enumerate(paths):
+        _write_test_video(path, seed=i)
+    reader = b1k_dataset.VideoFrameReader(max_open_files=2)
+    for path in paths:
+        reader.read(path, [0.0], tolerance_s=1e-4)
+    assert list(reader._containers) == [str(paths[1]), str(paths[2])]  # noqa: SLF001  -- oldest evicted
+    reader.read(paths[1], [0.0], tolerance_s=1e-4)
+    assert list(reader._containers) == [str(paths[2]), str(paths[1])]  # noqa: SLF001  -- most recent last
+    clone = pickle.loads(pickle.dumps(reader))  # what a spawned data-loader worker receives
+    assert clone._containers == {}  # noqa: SLF001
+    assert (clone.max_open_files, clone.decoder_threads) == (2, 1)
+    np.testing.assert_array_equal(clone.read(paths[0], [3 / FPS], tolerance_s=1e-4), reader.read(paths[0], [3 / FPS], 1e-4))
+    reader.close()
+    clone.close()
+
+
+def _add_video_streams(root: pathlib.Path, keys: dict[str, bool]) -> None:
+    """Declare video features (``key -> is_depth``) on a synthetic root and point every episode at file-000."""
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["video_path"] = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    for key, is_depth in keys.items():
+        info["features"][key] = {
+            "dtype": "video",
+            "shape": [64, 64, 1 if is_depth else 3],
+            "names": ["height", "width", "channels"],
+            "info": {"video.fps": FPS, "video.is_depth_map": is_depth},
+        }
+    info_path.write_text(json.dumps(info))
+    for episode_path in sorted((root / "meta" / "episodes").rglob("*.parquet")):
+        episodes = pd.read_parquet(episode_path)
+        for key in keys:
+            episodes[f"videos/{key}/chunk_index"] = episodes["data/chunk_index"]
+            episodes[f"videos/{key}/file_index"] = 0
+            episodes[f"videos/{key}/from_timestamp"] = 2.5  # camera time = row timestamp + this offset
+        episodes.to_parquet(episode_path)
+
+
+def test_dataset_decodes_only_selected_rgb_streams(full_root: pathlib.Path, monkeypatch):
+    from lerobot.datasets import dataset_reader
+
+    rgb, depth = "observation.rgb.head", "observation.depth.head"
+    _add_video_streams(full_root, {rgb: False, depth: True})
+    monkeypatch.setattr(dataset_reader.DepthEncoderConfig, "from_video_info", mock.Mock())
+    reads: list[tuple[str, list[float]]] = []
+
+    def fake_read(self, path, timestamps, tolerance_s):
+        reads.append((str(path), list(timestamps)))
+        return np.full((len(timestamps), 64, 64, 3), 7, dtype=np.uint8)
+
+    monkeypatch.setattr(b1k_dataset.VideoFrameReader, "read", fake_read)
+    lerobot_query = mock.Mock(side_effect=AssertionError("lerobot's decoder must not be used for RGB streams"))
+    monkeypatch.setattr(dataset_reader.DatasetReader, "_query_videos", lerobot_query)
+    for path in [full_root / "videos" / key / f"chunk-{chunk:03d}" / "file-000.mp4" for key in (rgb, depth) for chunk in range(3)]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    ds = b1k_dataset.B1KLeRobotDataset("org/demos", full_root, video_keys=[rgb], task_names="picking_up_trash")
+    assert ds.video_keys == [rgb]
+    item = ds[3]  # frame 3 of episode 2
+    assert item[rgb].dtype == torch.uint8
+    assert tuple(item[rgb].shape) == (64, 64, 3)
+    assert depth not in item  # never decoded, never requested
+    assert item["task"] == "picking_up_trash"
+    assert reads == [(str(full_root / "videos" / rgb / "chunk-001" / "file-000.mp4"), [pytest.approx(2.5 + 3 / FPS)])]
+    lerobot_query.assert_not_called()
+    # Depth streams (or the fast reader switched off) go through lerobot's decoder.
+    lerobot_query.side_effect = None
+    lerobot_query.return_value = {depth: torch.zeros(1, 64, 64)}
+    ds_depth = b1k_dataset.B1KLeRobotDataset("org/demos", full_root, video_keys=[rgb, depth], task_names="picking_up_trash")
+    item = ds_depth[0]
+    # Only the depth stream is handed to lerobot, with the row timestamp (it applies from_timestamp itself).
+    assert lerobot_query.call_args.args[0] == {depth: [pytest.approx(0.0)]}
+    assert item[depth].shape == (1, 64, 64)
+    assert item[rgb].shape == (64, 64, 3)
+    # Keys the dataset does not have are ignored (training configs request the robot's cameras blindly).
+    assert b1k_dataset.B1KLeRobotDataset("org/demos", full_root, video_keys=["observation.rgb.nope", rgb]).video_keys == [rgb]

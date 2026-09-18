@@ -478,10 +478,12 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
         # Build repack mapping dynamically based on available observations
         repack_mapping = {}
+        camera_keys = []
         for i in range(3):  # Support up to 3 cameras (image_0, image_1, image_2)
             image_key = f"image_{i}"
             if image_key in robot_config.observations:
                 repack_mapping[f"observation/{image_key}"] = robot_config.observations[image_key].dataset_key
+                camera_keys.append(robot_config.observations[image_key].dataset_key)
 
         # Add non-image observations
         repack_mapping.update(
@@ -514,13 +516,21 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         # You do not need to change anything here for your own dataset.
         model_transforms = ModelTransformFactory()(model_config)
 
+        base_config = self.create_base_config(assets_dirs, model_config)
+        # Decode only the camera streams the model consumes (the challenge demos also ship depth streams, which
+        # lerobot would otherwise decode and openpi would drop). `dataset_kwargs["video_keys"]` overrides this.
+        dataset_kwargs = dict(base_config.dataset_kwargs)
+        if isinstance(base_config.data_cls, type) and issubclass(base_config.data_cls, _b1k_dataset.B1KLeRobotDataset):
+            dataset_kwargs.setdefault("video_keys", camera_keys)
+
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             action_representation=_b1k_artifacts.action_representation(
                 robot_config, extra_delta_transform=self.extra_delta_transform
             ),
             allow_legacy_assets=self.allow_legacy_assets,
+            dataset_kwargs=dataset_kwargs,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,

@@ -20,6 +20,7 @@ reads local roots only, looks episodes up by ``episode_index``, and loads only t
 selected episodes (a one-task subset of the full root opens 6 parquet files instead of 955).
 """
 
+import collections
 from collections.abc import Iterable, Sequence
 import dataclasses
 import hashlib
@@ -29,6 +30,7 @@ import pathlib
 import re
 from typing import Any, Literal, get_args
 
+import av
 import datasets
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.dataset_reader import DatasetReader
@@ -414,13 +416,165 @@ class B1KDatasetMetadata(LeRobotDatasetMetadata):
         )
 
 
+def quiet_pyav_logging() -> None:
+    """Restore PyAV's default (no-op) FFmpeg log callback, once per process.
+
+    ``torchvision.io`` -- imported by lerobot -- calls ``av.logging.set_level(av.logging.ERROR)`` at import time,
+    which installs PyAV's Python-side log callback. That callback takes the GIL for every FFmpeg log line, and
+    libavformat emits tens of thousands of trace lines while parsing the index of a packed 200 MB mp4. With six
+    camera streams opened concurrently in threads (lerobot's ``_query_videos``) the GIL round-trips make each
+    ``av.open`` take ~2 s instead of ~2 ms (measured on the challenge demos), i.e. essentially all of a sample's
+    loading time. ``set_level(None)`` removes the callback; only PyAV's error-message bookkeeping is lost.
+    """
+    if not getattr(quiet_pyav_logging, "done", False):
+        av.logging.set_level(None)
+        quiet_pyav_logging.done = True  # type: ignore[attr-defined]
+
+
+class VideoFrameReader:
+    """Random access into packed LeRobot v3 videos with one long-lived decoder per file.
+
+    A LeRobot v3.0 root packs many episodes into one mp4 per camera; a training sample touches one frame of each
+    camera at a random position. lerobot's PyAV path re-opens the file for every access (parsing the index of a
+    200 MB file costs ~10 ms), converts *every* frame it decodes on the way from the keyframe to RGB, and returns
+    float32. This reader keeps an LRU of open containers per process (like the video readers of the diffusion
+    policy, ACT and GR00T baselines), decodes with one FFmpeg thread so many data-loader workers do not
+    oversubscribe the CPUs, converts only the frames that were asked for, and returns them as uint8 HWC -- which is
+    what the B1K image transforms turn lerobot's float32 CHW frames back into anyway, bit for bit.
+
+    Frame selection replicates ``lerobot.datasets.video_utils.decode_video_frames_pyav`` exactly: seek to the
+    keyframe at or before the first requested timestamp, decode forward until a frame at or past the last one, and
+    take, for each requested timestamp, the closest decoded frame (which must lie strictly within ``tolerance_s``).
+    Decoding from a keyframe yields the same pictures whether or not the container was just opened, so the frames
+    are identical to lerobot's.
+
+    Instances are created lazily per process (``__getstate__`` drops the open containers), so a dataset holding one
+    can be pickled into data-loader workers.
+    """
+
+    def __init__(self, *, max_open_files: int = 32, decoder_threads: int = 1):
+        if max_open_files < 1 or decoder_threads < 0:
+            raise ValueError("max_open_files must be >= 1 and decoder_threads >= 0")
+        self.max_open_files = max_open_files
+        self.decoder_threads = decoder_threads
+        self._containers: collections.OrderedDict[str, Any] = collections.OrderedDict()
+
+    def __getstate__(self):
+        return {"max_open_files": self.max_open_files, "decoder_threads": self.decoder_threads}
+
+    def __setstate__(self, state):
+        self.__init__(**state)
+
+    def close(self) -> None:
+        for container in self._containers.values():
+            container.close()
+        self._containers.clear()
+
+    def _container(self, path: str):
+        container = self._containers.get(path)
+        if container is None:
+            quiet_pyav_logging()
+            container = av.open(path)
+            stream = container.streams.video[0]
+            if self.decoder_threads:
+                # Frame/slice threading never changes decoded pixels; one thread per worker process scales best.
+                stream.thread_type = "SLICE" if self.decoder_threads == 1 else "AUTO"
+                stream.codec_context.thread_count = self.decoder_threads
+            self._containers[path] = container
+            while len(self._containers) > self.max_open_files:
+                self._containers.popitem(last=False)[1].close()
+        self._containers.move_to_end(path)
+        return container
+
+    def read(self, path: str | pathlib.Path, timestamps: Sequence[float], tolerance_s: float) -> np.ndarray:
+        """Frames at ``timestamps`` (seconds in the video's own time base) as uint8 ``[T, H, W, 3]`` RGB."""
+        path = str(path)
+        first_ts, last_ts = min(timestamps), max(timestamps)
+        container = self._container(path)
+        stream = container.streams.video[0]
+        # Same call as lerobot: offset in av.time_base units, land on the keyframe at or before first_ts.
+        container.seek(int(first_ts * av.time_base), backward=True)
+        decoded: list[tuple[float, Any]] = []
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                continue
+            current_ts = float(frame.pts * stream.time_base)
+            decoded.append((current_ts, frame))
+            if current_ts >= last_ts:
+                break
+        if not decoded:
+            raise ValueError(f"No frames could be decoded from {path} in the timestamp range [{first_ts}, {last_ts}].")
+        loaded_ts = np.asarray([ts for ts, _ in decoded], dtype=np.float64)
+        query_ts = np.asarray(timestamps, dtype=np.float64)
+        distances = np.abs(query_ts[:, None] - loaded_ts[None, :])
+        closest = distances.argmin(axis=1)
+        if not (distances[np.arange(len(query_ts)), closest] < tolerance_s).all():
+            raise ValueError(
+                f"Query timestamps {query_ts.tolist()} are farther than tolerance_s={tolerance_s} from the decoded "
+                f"frames {loaded_ts.tolist()} of {path}"
+            )
+        converted: dict[int, np.ndarray] = {}
+        for index in closest.tolist():
+            if index not in converted:
+                converted[index] = decoded[index][1].to_ndarray(format="rgb24")  # (H, W, 3) uint8, same as lerobot
+        return np.stack([converted[index] for index in closest.tolist()])
+
+
 class _B1KDatasetReader(DatasetReader):
     """``DatasetReader`` over an explicit list of data files, with lengths and frame-index mapping derived
-    from the rows actually loaded instead of the dataset-wide totals in ``meta/info.json``."""
+    from the rows actually loaded instead of the dataset-wide totals in ``meta/info.json``.
 
-    def __init__(self, *args, data_files: Sequence[pathlib.Path], **kwargs):
+    ``video_keys`` restricts decoding to those camera streams (the B1K robot configs use the three RGB cameras;
+    the depth streams of the challenge demos are not decoded at all). Selected non-depth streams are read with
+    :class:`VideoFrameReader`; depth streams, and everything when ``fast_video_reader`` is off, go through
+    lerobot's decoder (``video_backend``).
+    """
+
+    def __init__(
+        self,
+        *args,
+        data_files: Sequence[pathlib.Path],
+        video_keys: Iterable[str] | None = None,
+        fast_video_reader: bool = True,
+        decoder_threads: int = 1,
+        max_open_videos: int = 32,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self._data_files = [str(path) for path in data_files]
+        available = list(self._meta.video_keys)
+        if video_keys is None:
+            self._video_keys = available
+        else:
+            requested = {str(key) for key in video_keys}
+            if unknown := sorted(requested - set(available) - set(self._meta.camera_keys)):
+                # Training configs request the robot's cameras without knowing the dataset; a camera the dataset lacks
+                # surfaces as a missing key in the repack transform, with the dataset's keys listed here.
+                logging.warning("Video keys %s are not streams of this dataset (which has %s); ignoring them", unknown, available)
+            self._video_keys = [key for key in available if key in requested]
+        depth = set(self._meta.depth_keys)
+        self._fast_video_keys = frozenset(k for k in self._video_keys if k not in depth) if fast_video_reader else frozenset()
+        self._frame_reader = VideoFrameReader(max_open_files=max_open_videos, decoder_threads=decoder_threads)
+
+    @property
+    def video_keys(self) -> list[str]:
+        return list(self._video_keys)
+
+    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+        # Only the requested streams; everything else lerobot would decode (e.g. depth) is skipped entirely.
+        wanted = {key: ts for key, ts in query_timestamps.items() if key in self._video_keys}
+        slow = {key: ts for key, ts in wanted.items() if key not in self._fast_video_keys}
+        result = super()._query_videos(slow, ep_idx) if slow else {}
+        if len(wanted) > len(slow):
+            ep = self._meta.episodes[ep_idx]
+            for key, query_ts in wanted.items():
+                if key in slow:
+                    continue
+                from_timestamp = ep[f"videos/{key}/from_timestamp"]
+                path = self.root / self._meta.get_video_file_path(ep_idx, key)
+                frames = self._frame_reader.read(path, [from_timestamp + ts for ts in query_ts], self._tolerance_s)
+                result[key] = torch.from_numpy(frames).squeeze(0)  # (H, W, 3) uint8, or (T, H, W, 3) for several
+        return result
 
     def _load_hf_dataset(self) -> datasets.Dataset:
         features = get_hf_features_from_features(self._meta.features)
@@ -513,7 +667,15 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
 
     Accepts the ``LeRobotDataset`` read-mode constructor arguments used by openpi (``repo_id``, ``root``,
     ``episodes``, ``delta_timestamps``, ``tolerance_s``, ``video_backend``, ``image_transforms``,
-    ``return_uint8``); items are produced by lerobot's ``DatasetReader`` exactly as ``LeRobotDataset`` does.
+    ``return_uint8``); items are produced by lerobot's ``DatasetReader`` exactly as ``LeRobotDataset`` does,
+    except for the video frames:
+
+    - ``video_keys`` selects the camera streams to decode (default: every video stream of the dataset). Training
+      configs pass the robot config's cameras, so e.g. the challenge demos' depth streams are never decoded.
+    - Selected RGB streams are read by :class:`VideoFrameReader` (``fast_video_reader``, default on): one
+      long-lived single-threaded decoder per file and worker, only the requested frames converted, uint8 HWC
+      output -- the same pixels as lerobot's float32 CHW frames, ~100x cheaper per sample on the challenge demos.
+      ``decoder_threads`` / ``max_open_videos`` tune it; depth streams always use lerobot's decoder.
     """
 
     def __init__(
@@ -528,8 +690,17 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         video_backend: str | None = None,
         image_transforms: Any = None,
         return_uint8: bool = False,
+        video_keys: Iterable[str] | None = None,
+        fast_video_reader: bool = True,
+        decoder_threads: int = 1,
+        max_open_videos: int = 32,
     ):
         super().__init__()
+        if image_transforms is not None and (video_keys is not None or fast_video_reader):
+            raise ValueError(
+                "image_transforms are applied by lerobot to every camera stream as float CHW frames; use them only "
+                "with video_keys=None and fast_video_reader=False, or apply them in the data transforms instead."
+            )
         self.repo_id = repo_id
         self.root = pathlib.Path(root)
         self.meta = B1KDatasetMetadata(repo_id, self.root)
@@ -568,17 +739,28 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
             return_uint8=return_uint8,
             data_files=[self.root / path for path in data_files],
+            video_keys=video_keys,
+            fast_video_reader=fast_video_reader,
+            decoder_threads=decoder_threads,
+            max_open_videos=max_open_videos,
         )
         self.reader.load_and_activate()
         logging.info(
-            "B1KLeRobotDataset(%s): %d episodes, %d frames, %d data files under %s%s",
+            "B1KLeRobotDataset(%s): %d episodes, %d frames, %d data files under %s%s; decoding %s%s",
             repo_id,
             self.num_episodes,
             self.num_frames,
             len(data_files),
             self.root,
             f" (task subset {list(self.task_names)})" if self.task_names else "",
+            self.reader.video_keys,
+            " with VideoFrameReader" if self.reader._fast_video_keys else " with lerobot's decoder",  # noqa: SLF001
         )
+
+    @property
+    def video_keys(self) -> list[str]:
+        """Camera streams that are decoded for each item."""
+        return self.reader.video_keys
 
     @property
     def fps(self) -> int:

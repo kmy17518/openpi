@@ -54,6 +54,11 @@ _LOWDIM_IRRELEVANT_DATASET_KWARGS = frozenset(
         "image_transforms",
         "revision",
         "force_cache_sync",
+        # B1KLeRobotDataset video decoding options (openpi.training.b1k_dataset).
+        "video_keys",
+        "fast_video_reader",
+        "decoder_threads",
+        "max_open_videos",
     }
 )
 

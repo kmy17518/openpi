@@ -602,11 +602,23 @@ def _collate_fn(items):
 
 
 def _worker_init_fn(worker_id: int) -> None:
-    """Tell JAX inside the worker process not to preallocate the GPU memory."""
-    # NOTE: This is called after jax is imported inside the worker process. This
-    # means that this approach will not work for selecting the backend.
+    """Keep JAX inside a data-loader worker on the CPU, single-threaded, and off the training GPU.
+
+    The only JAX work in a worker is `image_tools.resize_with_pad` (`ResizeImages`). Workers are spawned with the
+    trainer's environment (`CUDA_VISIBLE_DEVICES`, `JAX_PLATFORMS=cuda`), so by default each one would create a CUDA
+    context on the training GPU for that resize and XLA:CPU would use every core for its thread pool -- with 8-32
+    workers on a CPU quota that oversubscribes the cores. jax is already imported here (the dataset was unpickled),
+    but its backend is not initialised until the first operation, so the platform can still be chosen.
+    """
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    flags = os.environ.get("XLA_FLAGS", "")
+    if "intra_op_parallelism_threads" not in flags:
+        os.environ["XLA_FLAGS"] = f"{flags} --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1".strip()
+    try:
+        jax.config.update("jax_platforms", "cpu")
+    except RuntimeError:  # backend already initialised in this worker; keep whatever it is
+        logging.warning("Data-loader worker %d: JAX backend already initialised, cannot pin it to the CPU", worker_id)
 
 
 class RLDSDataLoader:
