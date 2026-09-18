@@ -6,7 +6,7 @@ This tutorial walks through fine-tuning [π₀.₅](https://www.physicalintellig
 **OpenPi model:** π₀.₅ (`pi05`)  
 **Robot:** R1Pro (dual-arm mobile manipulator)
 
-> **This checkout (`my-clean`)** is the `my` branch as of commit `1bebd70` (2026-09-14, before its performance work), plus the correctness fixes from `my`'s 2026-09-16 audit that do not depend on that performance work (see [Fixes ported from the `my` audit](#fixes-ported-from-the-my-audit)) and the dependency pin that makes `uv sync` work on ARM hosts. Running it on a Blackwell Ultra (B300) or aarch64 host needs the environment settings in [Blackwell Ultra (B300) and ARM (aarch64) hosts](#blackwell-ultra-b300-and-arm-aarch64-hosts); the training commands below already include them.
+> **This checkout (`my-clean`)** is the `my` branch as of commit `1bebd70` (2026-09-14, before its performance work), plus the correctness fixes from `my`'s 2026-09-16 audit that do not depend on that performance work (see [Fixes ported from the `my` audit](#fixes-ported-from-the-my-audit)), the dependency pin that makes `uv sync` work on ARM hosts, and a rewritten video [data loader](#data-loader) (independent of `my`'s; modelled on the diffusion-policy, ACT and GR00T baselines). Running it on a Blackwell Ultra (B300) or aarch64 host needs the environment settings in [Blackwell Ultra (B300) and ARM (aarch64) hosts](#blackwell-ultra-b300-and-arm-aarch64-hosts); the training commands below already include them.
 
 > **Note:** Replace placeholders such as `<OPENPI_DIR>`, `<DATASET_ROOT>`, `<TASK_NAME>`, and `<REPO_ID>` with your own paths and identifiers throughout this guide.
 
@@ -279,6 +279,7 @@ outputs/checkpoints/<CONFIG_NAME>/<EXP_NAME>/<STEP>/
 | `--data.task-names` | Train only on these tasks (default: every task under the root) |
 | `--data.robot_config_name` | Override robot registry key |
 | `--data.allow-legacy-assets` | Accept norm stats / a resume checkpoint without `b1k_metadata.json` (see [Action-representation compatibility](#action-representation-compatibility)) |
+| `--num_workers` | Data-loader worker processes (default 8; ~22 ms of CPU per sample each, see [Data loader](#data-loader)) |
 | `--model.max-token-len` | Prompt + state token budget (default 200; see [Prompt length](#prompt-length-and-max_token_len)) |
 | `--resume` / `--overwrite` | Resume from latest checkpoint or start fresh |
 | `--val_log_interval` | Steps between validation loss evaluations |
@@ -390,23 +391,48 @@ The pinned toolchain — `jax[cuda12]==0.5.3`, `torch==2.7.1+cu128`, `torchcodec
 |---------|-------|---------------------------|
 | `uv sync`: `Distribution triton==3.3.1 @ registry+https://pypi.org/simple can't be installed ...` | PyPI ships only x86-64 wheels for the triton that `torch==2.7.1` requires | Nothing — `pyproject.toml` / `uv.lock` pin triton to PyTorch's cu128 index on aarch64, see [Installation](#installation) |
 | Training or serving dies with exit code 134 at the first jitted matmul; log: `Unknown compute capability 10.3. Defaulting to telling LLVM that we're compiling for sm_101`, then `F ... gemm_fusion_autotuner.cc ... ptxas exited with non-zero error code ... Instruction 'tcgen05.alloc' not supported on .target 'sm_101'` | XLA in jax 0.5.3 does not know compute capability 10.3 and falls back to the `sm_101` target, but its Triton GEMM emitter (XLA-internal, unrelated to the pip package `triton`) still generates Blackwell instructions for it | `export XLA_FLAGS=--xla_gpu_enable_triton_gemm=false` before `train_b1k.py` / `serve_b1k.py` / `compute_norm_stats.py`; matrix multiplies then run through cuBLAS. (`my` sets this automatically in `openpi.shared.xla_gpu_compat`.) The `Unknown compute capability 10.3` warning keeps being printed and is harmless |
-| Log: `torchcodec is installed but cannot be loaded (Could not load libtorchcodec ...); decoding videos with pyav` | torchcodec's wheel does not load against this torch on aarch64 | Nothing — `B1KLeRobotDataset` falls back to PyAV automatically |
-| The data loader is the bottleneck: with `--batch_size=576 --num_workers=8` the first batch takes ~16 min, then bursts of steps at the GPU rate followed by 14–19 min of idle GPU | Each worker decodes whole batches with lerobot's PyAV path (seek to the previous keyframe, decode forward, all six camera streams of a sample in six threads); ~1.7 s per sample here. `my` fixed this later (PyAV log callback, only the three RGB streams, uint8 frames) as part of its performance work, which this checkout deliberately does not include | Accept it as the baseline behaviour, or scale `--num_workers` (each worker needs ~2.3 cores) |
+| Log: `torchcodec is installed but cannot be loaded (Could not load libtorchcodec ...); decoding videos with pyav` | torchcodec's wheel does not load against this torch on aarch64 | Nothing — RGB streams are decoded by `VideoFrameReader` (PyAV) anyway, see [Data loader](#data-loader) |
+| (fixed) The data loader was the bottleneck: with `--batch_size=576 --num_workers=8` the first batch took ~16 min, then bursts of steps at the GPU rate followed by 14–19 min of idle GPU (~139 s/step, 4 samples/s) | lerobot's PyAV path re-opened every packed mp4 per sample, for all six camera streams in six threads, while `torchvision.io` had installed PyAV's Python log callback: each `av.open` took ~2 s of GIL contention instead of ~2 ms | Fixed in this checkout by the [data loader](#data-loader) rewrite (bit-identical samples, ~1,200 samples/s on 30 cores) |
 | The JAX compilation cache lands in `~/.cache/jax` even with `JAX_COMPILATION_CACHE_DIR` set | `train_b1k.py` sets `jax_compilation_cache_dir` to `~/.cache/jax` unconditionally (fixed on `my` in `5687c79`) | Point `HOME` at a scratch directory whose `.cache/jax` links to the cache you want |
 | `./scripts/b1k/train_b1k.sh`: `source: /home/ubuntu/.../.venv/bin/activate: No such file or directory` | hard-coded developer path (fixed on `my` in `5687c79`) | Edit the `source` line or use the direct `uv run` command |
 | `Unrecognized options: --data.base_config.dataset_root=...` | the challenge docs' spelling is only accepted on `my` | Use `--data.dataset-root` (and `--data.task-names`) |
 | `wandb.init` fails with `CommError: returned error 401` | the host's `WANDB_BASE_URL` points at a server the `WANDB_API_KEY` is not valid for | Set `WANDB_BASE_URL=https://api.wandb.ai` (and `WANDB_ENTITY`) explicitly, or `WANDB_MODE=offline` / `--no-wandb-enabled` |
 
-Measured with the single-GPU `turning_on_radio` command of [Fine-tune π₀.₅](#5-fine-tune-π₀₅) (batch 576, `max_token_len` 112, 8 workers, PyAV) on one B300:
+Measured with the single-GPU `turning_on_radio` command of [Fine-tune π₀.₅](#5-fine-tune-π₀₅) (`max_token_len` 112, PyAV, trainer + workers confined to 30 CPU cores) on one B300:
 
-| Quantity | This checkout | `my` (perf branch, same settings, its own run doc) |
-|----------|--------------:|--------------------------------------------------:|
-| GPU step time when a batch is ready | 10.8 s | 9.83 s |
-| Peak GPU memory | 263.6 GiB | 263.65 GiB |
-| First batch after launch | 16.5 min | — |
-| Steady-state throughput (loader-bound) | ~139 s/step ≈ 4.1 samples/s | 58.6 samples/s |
+| Quantity | Before the loader rewrite (batch 576, 8 workers) | After (batch 512, 16 workers) | `my` (perf branch, batch 576, its own run doc) |
+|----------|------------------:|------------------:|--------------------------------------------------:|
+| GPU step time | 10.8 s | 9.1 s | 9.83 s |
+| Peak GPU memory | 263.6 GiB | 263.6 GiB | 263.65 GiB |
+| Data loader ready after launch | 16.5 min | 87 s | — |
+| Steady-state throughput | ~139 s/step ≈ 4.1 samples/s (GPU idle 92 %) | 9.1 s/step = 56 samples/s, GPU 100 % busy | 58.6 samples/s |
 
-The GPU-side difference is small (the remat policy is the same `nothing_saveable`, hard-coded in `gemma.py` / `siglip.py`); the throughput gap is the data loader.
+The GPU-side numbers are close (the remat policy is the same `nothing_saveable`, hard-coded in `gemma.py` / `siglip.py`); the old throughput gap was entirely the data loader.
+
+---
+
+### Data loader
+
+`B1KLeRobotDataset` (`src/openpi/training/b1k_dataset.py`) reads the LeRobot v3 root with lerobot's `DatasetReader` except for the video frames, which go through its own `VideoFrameReader`. The design takes the ideas the diffusion-policy, ACT and GR00T BEHAVIOR baselines use for the same data (their `VideoReader` / `_decode` / `VideoReaderPool`, RGB-only camera selection, uint8 frames), and does **not** follow the `my` branch's loader changes. Samples are bit-identical to the lerobot path (verified on real data across the full transform pipeline, and by `b1k_dataset_test.py` on synthetic H.264 clips).
+
+Why the stock path was slow on the challenge demos (profile of one sample, single process, 30 cores available): lerobot's PyAV decoder **re-opens the packed 200 MB mp4 for every access** and does so for **all six camera streams at once in six threads**. `torchvision.io` (imported by lerobot) installs PyAV's Python-side FFmpeg log callback at import time; parsing an mp4 index emits tens of thousands of log lines, each taking the GIL, so six concurrent `av.open` calls took **1.9–2.3 s** instead of 3 ms. Everything else was cheap: seek + decode of a random frame costs 7 ms (720²) / 3 ms (480²), and the transforms ~16 ms. Result: 2.45 s per sample, 4 samples/s from 8 workers, 92 % GPU idle.
+
+What `VideoFrameReader` does instead:
+
+| Change | Idea from | Effect |
+|--------|-----------|--------|
+| `av.logging.set_level(None)` once per process before decoding | ACT's `_decode` | removes the GIL storm: 6 opens 1.93 s → 3 ms |
+| One long-lived container per file and worker (LRU, `max_open_videos=32`), seek to the keyframe, decode forward | diffusion policy `VideoReader`, ACT `_decode`, GR00T `VideoReaderPool` | no per-sample index parse (~10 ms per open); GOP 8 → ~6 frames decoded per access |
+| Only the robot config's camera streams (`video_keys`, set by `LeRobotB1KDataConfig.create`) — the three RGB cameras; the three depth streams are never decoded | GR00T RGB view, ACT `VIDEO_KEYS`, diffusion policy `cameras` | halves the decoding |
+| Streams decoded sequentially with one FFmpeg thread (`decoder_threads=1`) instead of a 6-thread pool per sample | ACT `thread_count = 1`, GR00T `GR00T_FFMPEG_THREADS` | workers scale linearly under a CPU quota, no oversubscription |
+| Only the requested frames are converted to RGB, returned as uint8 HWC | ACT / diffusion policy uint8 frames | lerobot converted every decoded frame and returned float32 CHW, which `B1KInputs` turned back into uint8 HWC (bit-identical: `(255 * (v / 255)).astype(uint8) == v` for all 256 values) |
+| Data-loader workers pin JAX to the CPU, single-threaded (`_worker_init_fn`) | GR00T's CPU-only workers | `ResizeImages` (`jax.image.resize`) no longer creates a CUDA context per worker on the training GPU; XLA:CPU does not spawn a thread pool per worker |
+
+Throughput of the loader alone at batch 512 (`scripts/b1k/benchmark_loader.py`, trainer process + workers pinned to 30 cores, steady state beyond the prefetch depth): **395 samples/s with 8 workers, ~1,150 with 16, ~1,200 with 24–28** (then limited by the main process's collate/IPC); 22 ms of CPU per sample in a worker (≈13 ms decode, ≈14 ms `ResizeImages`), first batch ~12 s after the workers spawn. The GPU consumes ~56 samples/s at batch 512, so `--num_workers=8` already keeps it busy; 16 leaves ample headroom and is what the measured run used.
+
+Knobs (`dataset_kwargs` of the data config, i.e. `LeRobotB1KDataConfig.base_config.dataset_kwargs`): `video_keys` (streams to decode; default: the robot's cameras), `fast_video_reader` (default `True`; `False` = lerobot's decoder for everything), `decoder_threads` (default 1), `max_open_videos` (default 32). Depth streams, if requested, always use lerobot's decoder. `image_transforms` are only accepted with the lerobot path.
+
+Not done (next steps if ever needed): a pixel-exact cache of pre-resized uint8 frames (diffusion policy / ACT `frame_cache`; ~150 KB × 3 per sample, ~190 GB for `turning_on_radio` at 224²) or GR00T's losslessly re-encoded pre-resized "RGB view" would remove decoding from the workers entirely; a faster `ResizeImages` (currently ~14 ms per sample on XLA:CPU) would matter before that.
 
 ---
 
