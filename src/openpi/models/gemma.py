@@ -52,8 +52,8 @@ AttentionImpl: TypeAlias = Literal["xla", "cudnn"]
 def remat_policy_name() -> str:
     """$OPENPI_REMAT_POLICY: a `jax.checkpoint_policies` name (default `nothing_saveable`, i.e. recompute every
     transformer layer in the backward pass) or `save_mlp` (keep the Gemma MLP gate/up GEMM outputs tagged in
-    `lora.FeedForward`, recompute the rest). `save_mlp` needs the activation memory of small microbatches
-    (TrainConfig.num_microbatches) to fit."""
+    `lora.FeedForward`, recompute the rest). `save_mlp` needs the activation memory of a small per-GPU batch
+    (<= ~128 samples on a 288 GB B300) to fit."""
     return os.environ.get("OPENPI_REMAT_POLICY", "nothing_saveable")
 
 

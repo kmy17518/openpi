@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Single-GPU pi0.5 BEHAVIOR-1K training launch for this checkout (branch my-clean), with the environment a
-# Blackwell Ultra (B300) / aarch64 host needs. See docs/b1k.md, sections "Fine-tune" and "Blackwell Ultra (B300)
+# pi0.5 BEHAVIOR-1K training launch for this checkout (branch my-clean), with the environment a Blackwell Ultra
+# (B300) / aarch64 host needs. Defaults use all four GPUs of the node (data parallel, one process). See docs/b1k.md, sections "Fine-tune" and "Blackwell Ultra (B300)
 # and ARM (aarch64) hosts".
 #
 #   scripts/b1k/launch.sh [extra train_b1k.py flags, e.g. --resume]
 #
 # Everything is overridable through environment variables (defaults in brackets):
-#   EXP_NAME       experiment / checkpoint name          [turning-on-radio-1gpu-bs${BATCH_SIZE}-clean-<today>]
-#   BATCH_SIZE     [512]        NUM_WORKERS [16]          NUM_TRAIN_STEPS [300000]   MAX_TOKEN_LEN [112]
-#   GPU            CUDA_VISIBLE_DEVICES [1]               CPUS  taskset core list     [30-59]
+#   EXP_NAME       experiment / checkpoint name          [turning-on-radio-<n>gpu-bs${BATCH_SIZE}-clean-<today>]
+#   BATCH_SIZE     global [512]  NUM_WORKERS [16]         NUM_TRAIN_STEPS [300000]   MAX_TOKEN_LEN [200]
+#   GPU            CUDA_VISIBLE_DEVICES [0,1,2,3]         CPUS  taskset core list     [0-143]
 #   TASK_NAMES     [turning_on_radio]                     PROMPT_SOURCE               [task_name]
 #   REPO_ID        [behavior-1k/2026-challenge-demos]     DATASET_ROOT [/tmp/dev/datasets/2026-challenge-demos]
 #   WANDB_PROJECT  [b1k-challenge-2026-pi]                WANDB_RUN_ID (optional; W&B generates one if unset)
@@ -19,13 +19,13 @@
 #   ENV_FILE       sourced first if it exists            [/tmp/dev/env.sh]
 #   PYTHON         interpreter (relative to the checkout) [.venv-jax/bin/python: JAX 0.11 / CUDA 13, see docs/b1k.md
 #                  "GPU step time"]; .venv/bin/python is the original jax 0.5.3 environment
-#   NUM_MICROBATCHES  gradient accumulation microbatches per step [4]  (TrainConfig.num_microbatches)
 #   OPENPI_ATTENTION  xla | cudnn        attention kernel (openpi.models.gemma.attention_core)   [cudnn]
 #   OPENPI_REMAT_POLICY  nothing_saveable | save_mlp | a jax.checkpoint_policies name (gemma.remat_block) [save_mlp]
-#   XLA_PYTHON_CLIENT_PREALLOCATE [true]   XLA_PYTHON_CLIENT_MEM_FRACTION [0.97]
-# The defaults are the fastest measured configuration (7.6 s/step at batch 512 vs 10.3 s for the original stack);
-# the original behaviour is PYTHON=.venv/bin/python OPENPI_ATTENTION=xla OPENPI_REMAT_POLICY=nothing_saveable
-# NUM_MICROBATCHES=1 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95.
+#   XLA_PYTHON_CLIENT_PREALLOCATE [true]   XLA_PYTHON_CLIENT_MEM_FRACTION [0.95]
+# The global batch is split across the GPUs (128 per GPU with the defaults), which is small enough for save_mlp.
+# On a single GPU (GPU=1 CPUS=30-59) use OPENPI_REMAT_POLICY=nothing_saveable (save_mlp does not fit 512 samples;
+# measured 8.05 s/step at max_token_len 112 vs 10.3 s for the original stack). The original behaviour is
+# PYTHON=.venv/bin/python OPENPI_ATTENTION=xla OPENPI_REMAT_POLICY=nothing_saveable XLA_PYTHON_CLIENT_PREALLOCATE=false.
 #
 # The 2026-09-17 reference run (300k steps, GPU 1, CPUs 30-59) used BATCH_SIZE=576 NUM_WORKERS=8
 # EXP_NAME=turning-on-radio-1gpu-bs576-300k-clean-20260917 WANDB_RUN_ID=piradio18clean, mirroring the `my`
@@ -47,13 +47,14 @@ BATCH_SIZE=${BATCH_SIZE:-512}
 NUM_WORKERS=${NUM_WORKERS:-16}
 NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS:-300000}
 MAX_TOKEN_LEN=${MAX_TOKEN_LEN:-200}
-GPU=${GPU:-1}
-CPUS=${CPUS:-30-59}
+GPU=${GPU:-0,1,2,3}
+CPUS=${CPUS:-0-143}
+NGPU=$(( $(tr -cd ',' <<< "$GPU" | wc -c) + 1 ))
 TASK_NAMES=${TASK_NAMES:-turning_on_radio}
 PROMPT_SOURCE=${PROMPT_SOURCE:-task_name}
 REPO_ID=${REPO_ID:-behavior-1k/2026-challenge-demos}
 DATASET_ROOT=${DATASET_ROOT:-/tmp/dev/datasets/2026-challenge-demos}
-EXP_NAME=${EXP_NAME:-turning-on-radio-1gpu-bs${BATCH_SIZE}-clean-$(date +%Y%m%d)}
+EXP_NAME=${EXP_NAME:-turning-on-radio-${NGPU}gpu-bs${BATCH_SIZE}-clean-$(date +%Y%m%d)}
 RUN_DIR=${RUN_DIR:-/tmp/dev/runs/$EXP_NAME}
 LOG=${LOG:-/tmp/dev/logs/$EXP_NAME.train.log}
 mkdir -p "$RUN_DIR" "$(dirname "$LOG")"
@@ -71,8 +72,8 @@ export WANDB_MODE=${WANDB_MODE:-offline} WANDB_ENTITY=${WANDB_ENTITY:-kmy17518} 
 [ -n "${WANDB_RUN_ID:-}" ] && export WANDB_RUN_ID
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
 # JAX 0.11's train_step needs one ~190 GiB temporary buffer; with on-demand growth the BFC allocator cannot always
-# carve it out of its regions (OOM at step 0), hence preallocation. 0.97 is needed for save_mlp with 4 microbatches.
-export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-true} XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.97}
+# carve it out of its regions (OOM at step 0), hence preallocation.
+export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-true} XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.95}
 export OPENPI_ATTENTION=${OPENPI_ATTENTION:-cudnn} OPENPI_REMAT_POLICY=${OPENPI_REMAT_POLICY:-save_mlp}
 export JAX_PLATFORMS=cuda PYTHONUNBUFFERED=1
 # jax 0.5.3's XLA does not know the GB300 (compute capability 10.3): its Triton GEMM autotuner aborts the process at
@@ -81,7 +82,7 @@ export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false"
 
 cd "$OPENPI_DIR" || exit 1
 PYTHON=${PYTHON:-.venv-jax/bin/python}
-echo "[$(date '+%F %T')] launching $EXP_NAME (batch $BATCH_SIZE, $NUM_WORKERS workers, GPU $GPU, CPUs $CPUS, W&B run id ${WANDB_RUN_ID:-<auto>}, python $PYTHON) from $OPENPI_DIR @ $(git rev-parse --short HEAD)" | tee -a "$LOG"
+echo "[$(date '+%F %T')] launching $EXP_NAME (global batch $BATCH_SIZE on $NGPU GPU(s) [$GPU], $NUM_WORKERS workers, CPUs $CPUS, W&B run id ${WANDB_RUN_ID:-<auto>}, python $PYTHON) from $OPENPI_DIR @ $(git rev-parse --short HEAD)" | tee -a "$LOG"
 # shellcheck disable=SC2086
 taskset -c "$CPUS" "$PYTHON" -u scripts/b1k/train_b1k.py pi05_b1k \
     --exp_name="$EXP_NAME" \
@@ -89,7 +90,6 @@ taskset -c "$CPUS" "$PYTHON" -u scripts/b1k/train_b1k.py pi05_b1k \
     --batch_size="$BATCH_SIZE" \
     --num_workers="$NUM_WORKERS" \
     --num_train_steps="$NUM_TRAIN_STEPS" \
-    --num_microbatches="${NUM_MICROBATCHES:-4}" \
     --save_interval=2500 \
     --keep_period None \
     --log_interval=10 \

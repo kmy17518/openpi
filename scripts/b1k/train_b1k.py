@@ -356,34 +356,7 @@ def train_step(
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    grad_fn = nnx.value_and_grad(loss_fn, argnums=diff_state)
-    if config.num_microbatches <= 1:
-        loss, grads = grad_fn(model, train_rng, observation, actions)
-    else:
-        # Gradient accumulation over microbatches (see TrainConfig.num_microbatches). The loop is a lax.scan so the
-        # program size does not grow with the number of microbatches; gradients are accumulated in f32.
-        n = config.num_microbatches
-        if actions.shape[0] % n:
-            raise ValueError(f"batch size {actions.shape[0]} is not divisible by num_microbatches={n}")
-        micro = jax.tree.map(lambda x: x.reshape(n, x.shape[0] // n, *x.shape[1:]), (observation, actions))
-        graphdef, model_state = nnx.split(model)
-
-        def microbatch_step(carry, xs):
-            loss_acc, grads_acc = carry
-            i, (obs_i, act_i) = xs
-            # Re-wrap the (closed-over) parameter arrays in Variables belonging to this trace level; nnx refuses to
-            # merge graph nodes created outside the scan body.
-            body_state = jax.tree.map(lambda x: x, model_state)
-            loss_i, grads_i = grad_fn(nnx.merge(graphdef, body_state), jax.random.fold_in(train_rng, i), obs_i, act_i)
-            grads_acc = jax.tree.map(lambda a, g: a + g.astype(jnp.float32), grads_acc, grads_i)
-            return (loss_acc + loss_i.astype(jnp.float32), grads_acc), None
-
-        grads_zero = jax.tree.map(
-            lambda p: jnp.zeros(p.shape, jnp.float32), state.params.filter(config.trainable_filter)
-        )
-        (loss, grads), _ = jax.lax.scan(microbatch_step, (jnp.float32(0.0), grads_zero), (jnp.arange(n), micro))
-        loss = loss / n
-        grads = jax.tree.map(lambda g, p: (g / n).astype(p.dtype), grads, state.params.filter(config.trainable_filter))
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)

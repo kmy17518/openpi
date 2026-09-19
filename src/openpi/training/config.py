@@ -688,11 +688,6 @@ class TrainConfig:
     seed: int = 42
     # Global batch size.
     batch_size: int = 32
-    # Gradient accumulation: split each batch into this many microbatches whose gradients are averaged before the
-    # optimizer step (same maths as one big batch up to floating-point summation order). Smaller microbatches need
-    # less activation memory, which lets the transformer layers keep their activations instead of recomputing them
-    # in the backward pass (OPENPI_REMAT_POLICY=none). Must divide batch_size.
-    num_microbatches: int = 1
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 8
