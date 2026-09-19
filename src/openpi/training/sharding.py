@@ -20,7 +20,12 @@ def make_mesh(num_fsdp_devices: int) -> jax.sharding.Mesh:
             f"Number of devices {jax.device_count()} must be divisible by the number of FSDP devices {num_fsdp_devices}."
         )
     mesh_shape = (jax.device_count() // num_fsdp_devices, num_fsdp_devices)
-    return jax.make_mesh(mesh_shape, (BATCH_AXIS, FSDP_AXIS))
+    # JAX >= 0.7 defaults mesh axes to `Explicit` sharding mode, under which `with_sharding_constraint` (used in
+    # `activation_sharding_constraint`) is rejected. This code base relies on the classic `Auto` mode.
+    kwargs = {}
+    if hasattr(jax.sharding, "AxisType"):
+        kwargs["axis_types"] = (jax.sharding.AxisType.Auto,) * len(mesh_shape)
+    return jax.make_mesh(mesh_shape, (BATCH_AXIS, FSDP_AXIS), **kwargs)
 
 
 @contextlib.contextmanager

@@ -27,6 +27,7 @@ We follow this einsum axis naming convention:
 
 from collections.abc import Sequence
 import dataclasses
+import os
 from typing import Literal, TypeAlias
 
 import einops
@@ -39,6 +40,69 @@ import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
 PALIGEMMA_VOCAB_SIZE = 257_152
+
+# Attention kernel selection, read once at trace time from $OPENPI_ATTENTION:
+#   xla    (default) the original big_vision code: materialised f32 logits, masked softmax, two einsums. On GPU this
+#          moves ~80 GB of HBM traffic per Gemma layer per step at batch 512 (see docs/b1k.md, "GPU step time").
+#   cudnn  openpi.models.fused_attention: cuDNN fused (flash) attention forward + a transpose-free hand-written
+#          backward (XLA's cuDNN backward does not support head_dim 256). Needs JAX >= 0.7 with cuDNN >= 9.11.
+AttentionImpl: TypeAlias = Literal["xla", "cudnn"]
+
+
+def remat_policy_name() -> str:
+    """$OPENPI_REMAT_POLICY: a `jax.checkpoint_policies` name (default `nothing_saveable`, i.e. recompute every
+    transformer layer in the backward pass) or `save_mlp` (keep the Gemma MLP gate/up GEMM outputs tagged in
+    `lora.FeedForward`, recompute the rest). `save_mlp` needs the activation memory of small microbatches
+    (TrainConfig.num_microbatches) to fit."""
+    return os.environ.get("OPENPI_REMAT_POLICY", "nothing_saveable")
+
+
+def remat_block(block_cls, *, static_argnums):
+    """Wrap a scanned transformer block in `nn.remat` according to $OPENPI_REMAT_POLICY."""
+    name = remat_policy_name()
+    if name == "save_mlp":
+        policy = jax.checkpoint_policies.save_only_these_names("mlp_gate", "mlp_up")
+    else:
+        policy = getattr(jax.checkpoint_policies, name, None)
+    if policy is None:
+        raise ValueError(f"unknown OPENPI_REMAT_POLICY={name!r}")
+    return nn.remat(block_cls, prevent_cse=False, static_argnums=static_argnums, policy=policy)
+
+
+def attention_impl() -> AttentionImpl:
+    impl = os.environ.get("OPENPI_ATTENTION", "xla")
+    if impl not in ("xla", "cudnn"):
+        raise ValueError(f"OPENPI_ATTENTION must be xla or cudnn; got {impl!r}")
+    return impl  # type: ignore[return-value]
+
+
+def attention_core(
+    q: at.Float[at.Array, "b t n h"],
+    k: at.Float[at.Array, "b s k h"],
+    v: at.Float[at.Array, "b s k h"],
+    attn_mask: at.Bool[at.Array, "b 1 t s"],
+    *,
+    num_kv_heads: int,
+) -> at.Float[at.Array, "b t n h"]:
+    """softmax(q k^T + mask) v for grouped-query attention; `q` is expected to be pre-scaled.
+
+    True entries of `attn_mask` are attended to. Both implementations return the same values up to bf16 rounding
+    (`gemma_attention_test.py`).
+    """
+    if attention_impl() == "cudnn":
+        from openpi.models import fused_attention
+
+        return fused_attention.cudnn_attention(q, k, v, attn_mask)
+
+    dtype = q.dtype
+    q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=num_kv_heads)
+    logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
+    # big_neg = jnp.finfo(logits.dtype).min
+    big_neg = -2.3819763e38  # See gemma/modules.py
+    masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+    probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+    encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
+    return einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
 
 @dataclasses.dataclass
@@ -213,22 +277,12 @@ class Attention(nn.Module):
             k = jnp.concatenate([cache_k, k], axis=1)
             v = jnp.concatenate([cache_v, v], axis=1)
 
-        q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
-        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
-
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
                 f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
             )
 
-        # big_neg = jnp.finfo(logits.dtype).min
-        big_neg = -2.3819763e38  # See gemma/modules.py
-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
-
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
-
-        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
-        encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+        encoded = attention_core(q, k, v, attn_mask, num_kv_heads=self.configs[0].num_kv_heads)
 
         out = []
         start = 0
@@ -356,12 +410,7 @@ class Module(nn.Module):
             embed_dim=self.configs[0].width,  # embedder for first expert only
             name="embedder",
         )
-        block_cls = nn.remat(
-            Block,
-            prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
-            policy=jax.checkpoint_policies.nothing_saveable,
-        )
+        block_cls = remat_block(Block, static_argnums=(5,))  # 0=self, 6=deterministic
         self.layers = nn.scan(
             block_cls,
             variable_axes={"params": 0},

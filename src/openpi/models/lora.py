@@ -3,6 +3,7 @@ import re
 
 import flax.linen as nn
 import flax.struct as struct
+from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 
 import openpi.shared.array_typing as at
@@ -123,17 +124,25 @@ class FeedForward(nn.Module):
     @nn.compact
     def __call__(self, x):
         dtype = x.dtype  # original dtype, could be half-precision
-        ff_gate = self._dot(
-            x,
-            self.w_gating[0],
-            None if self.w_gating_lora is None else (self.w_gating_lora[0][0], self.w_gating_lora[1][0]),
+        # `checkpoint_name` tags let OPENPI_REMAT_POLICY=save_mlp (openpi.models.gemma.remat_block) keep these two
+        # GEMM outputs, the largest activations of a layer, instead of recomputing them in the backward pass.
+        ff_gate = checkpoint_name(
+            self._dot(
+                x,
+                self.w_gating[0],
+                None if self.w_gating_lora is None else (self.w_gating_lora[0][0], self.w_gating_lora[1][0]),
+            ),
+            "mlp_gate",
         )
         gate_value = nn.gelu(ff_gate)
 
-        ff1 = self._dot(
-            x,
-            self.w_gating[1],
-            None if self.w_gating_lora is None else (self.w_gating_lora[0][1], self.w_gating_lora[1][1]),
+        ff1 = checkpoint_name(
+            self._dot(
+                x,
+                self.w_gating[1],
+                None if self.w_gating_lora is None else (self.w_gating_lora[0][1], self.w_gating_lora[1][1]),
+            ),
+            "mlp_up",
         )
         activations = gate_value * ff1
 

@@ -419,6 +419,39 @@ The GPU-side numbers are close (the remat policy is the same `nothing_saveable`,
 
 ---
 
+### GPU step time: JAX 0.11, fused attention, gradient accumulation
+
+Everything below was measured with `scripts/b1k/launch.sh` as is (batch 512, `max_token_len` 112, GPU 1, 16 loader workers on cores 30-59), 16 steps under Nsight Systems with steps 0-2 discarded; tooling in `/tmp/dev/profiling` (`run_profile.sh`, `analyze.py`, `roofline.py`). Sustained runs sit at the 1200 W power cap of the GB300 Max-Q (SM clock ~1.65 GHz instead of 2.07 GHz), so short micro-benchmarks run ~8 % faster than these steady-state numbers.
+
+| | step time | vs. baseline | how |
+|---|---:|---:|---|
+| 1. baseline: jax 0.5.3 / CUDA 12.9, XLA attention | 10.31 s | 1.00× | `PYTHON=.venv/bin/python` |
+| 2. jax 0.11.1 / CUDA 13.4 / cuDNN 9.26 (`.venv-jax`) | 8.66 s | 1.19× | `PYTHON=.venv-jax/bin/python XLA_PYTHON_CLIENT_PREALLOCATE=true` |
+| 3. + cuDNN flash-attention forward, transpose-free hand-written backward | 8.05 s | 1.28× | `OPENPI_ATTENTION=cudnn` |
+| 4. FlashAttention-4 forward and backward instead of 3. (tried and removed again, see below) | 8.05 s | 1.28× | — |
+| 5. + gradient accumulation, MLP activations kept instead of recomputed | 7.60 s | 1.36× | `NUM_MICROBATCHES=4 OPENPI_REMAT_POLICY=save_mlp XLA_PYTHON_CLIENT_MEM_FRACTION=0.97` |
+
+Where the time went in the baseline (see the roofline analysis in `/tmp/dev/profiling/runs/*/roofline.md`): 55 % GEMMs at 60 % of the achievable bf16 peak, 24 % XLA's unfused attention (f32 logits materialised and shuffled through three layout-transpose kernels running at 0.6-2 TB/s), 15 % other memory-bound fusions, and a full forward recompute of every layer in the backward pass (`nothing_saveable`). The JAX upgrade alone fixes the transposes (XLA 0.11 emits them properly) and knows the GPU (no `sm_101` fallback, Triton GEMMs would work again). Fused attention then removes the remaining softmax traffic. FlashAttention-4 (`flash-attn-4` 4.0.0b31, dedicated head-dim-256 Blackwell kernels, called from the jitted program through an XLA-FFI→Python→torch bridge, pi0's block mask realised as two packed-varlen calls per layer) measured exactly the same 8.05 s: attention is only ~5 % of the step once the transposes are gone, and FA4's Python round trip per layer plus the pack/unpack gathers for the varlen layout ate what its faster kernels (fwd 4 ms, bwd 13 ms per layer at batch 512 vs. 9/16 ms for the cuDNN variant) saved, while it also broke XLA's command buffers (host dispatch only ~2 s ahead of the GPU instead of ~7.6 s). It was removed again; the cuDNN path is pure JAX. Gradient accumulation with `save_mlp` removes the recompute of the MLP GEMMs (0.7 s of GPU time) but multiplies kernel launches by the number of microbatches; the host thread then becomes the limiter for 0.3-0.4 s per step (GPU idle inside the step, visible as a ~0.3 s "cushion" instead of ~7 s), so the net gain is smaller than the GPU-time saving. Re-enabling XLA's Triton GEMMs (possible again with XLA 0.11) was 1.5 % slower than cuBLAS on this model, so `launch.sh` keeps `--xla_gpu_enable_triton_gemm=false`.
+
+#### JAX 0.11 environment (`.venv-jax`)
+
+`uv venv --python 3.12 .venv-jax`, then `uv pip install -r /tmp/dev/profiling/jax-upgrade/requirements-jax0112.txt` (the direct dependencies of `pyproject.toml` with `jax[cuda13]==0.11.1`, `flax==0.12.9`, `orbax-checkpoint==0.12.4`, `optax==0.2.8`, `chex==0.1.92`, `numpy>=2.1`; run `uv pip` from outside the checkout so `[tool.uv] override-dependencies` does not pin `ml-dtypes`/`tensorstore` back), `uv pip install --no-deps -e . -e packages/openpi-client`, `torch==2.10.0+cu130` / `torchvision==0.25.0+cu130` from PyTorch's cu130 index (CUDA 13 like JAX; torch only runs the data loader on the CPU), and the CUDA libraries JAX was built against (`nvidia-cublas>=13.8`, `nvidia-cudnn-cu13>=9.26`, `nvidia-cuda-runtime>=13.4`, ...) installed over torch's exact pins. One site hook makes the venv self-consistent: `openpi_cudnn_preload.pth` loads those CUDA-13 libraries before `import torch` can load its older copies (same sonames).
+
+Code changes for the new stack: `sharding.make_mesh` requests `Auto` mesh axes (JAX ≥ 0.7 defaults to `Explicit`, which rejects `with_sharding_constraint`); `model.restore_params` reads orbax ≥ 0.11's `StepMetadata`; `array_typing` skips jaxtyping's dataclass checks during JAX/nnx tree rebuilds (`jax._src.flattree`, `flax.nnx.transforms.*`). The step needs one ~190 GiB temporary, which the BFC allocator cannot always carve out of on-demand regions: use `XLA_PYTHON_CLIENT_PREALLOCATE=true`.
+
+#### Attention back ends (`OPENPI_ATTENTION`)
+
+`openpi.models.gemma.attention_core` selects the kernel; both agree to bf16 rounding (`src/openpi/models/gemma_attention_test.py`).
+
+* `xla` (default): the original einsum / masked softmax / einsum.
+* `cudnn` (`openpi/models/fused_attention.py`): cuDNN's fused forward through `jax.nn.dot_product_attention` (returns the log-sum-exp as residual) plus a custom backward that folds the 8 query heads into the token axis so every matmul keeps the key axis minor. XLA's own cuDNN backward is limited to head_dim ≤ 128 (`cuda_dnn.cc`), Gemma uses 256.
+
+#### Rematerialization and gradient accumulation
+
+`OPENPI_REMAT_POLICY` (`openpi.models.gemma.remat_block`, used by the Gemma and SigLIP layer scans): `nothing_saveable` (default; every layer's forward is recomputed in the backward) or `save_mlp` (keep the gating/up GEMM outputs tagged with `checkpoint_name` in `lora.FeedForward`; 2 × [tokens, 16384] bf16 per layer, i.e. 533 GB at batch 512 and 133 GB at microbatch 128). It needs the activation memory of a smaller batch: `TrainConfig.num_microbatches` (`NUM_MICROBATCHES` in `launch.sh`) splits each batch into microbatches whose gradients are accumulated in f32 inside a `lax.scan` and averaged before the optimizer step; the RNG is folded per microbatch. At batch 512 on a 288 GB B300, `save_mlp` fits with 4 microbatches and `XLA_PYTHON_CLIENT_MEM_FRACTION=0.97`. Keeping every activation (no remat) does not fit even at microbatch 64.
+
+---
+
 ### Data loader
 
 `B1KLeRobotDataset` (`src/openpi/training/b1k_dataset.py`) reads the LeRobot v3 root with lerobot's `DatasetReader` except for the video frames, which go through its own `VideoFrameReader`. The design takes the ideas the diffusion-policy, ACT and GR00T BEHAVIOR baselines use for the same data (their `VideoReader` / `_decode` / `VideoReaderPool`, RGB-only camera selection, uint8 frames), and does **not** follow the `my` branch's loader changes. Samples are bit-identical to the lerobot path (verified on real data across the full transform pipeline, and by `b1k_dataset_test.py` on synthetic H.264 clips).

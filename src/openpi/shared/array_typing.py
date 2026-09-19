@@ -31,10 +31,16 @@ _original_check_dataclass_annotations = jaxtyping._decorator._check_dataclass_an
 Array = jax.Array | torch.Tensor
 
 
+_TREE_MANIPULATION_MODULES = (
+    "jax._src.tree_util",
+    "jax._src.flattree",  # JAX >= 0.7 unflattens through here (e.g. inside nnx.value_and_grad)
+    "flax.nnx.transforms.",  # compilation, autodiff, ... all rebuild pytrees with placeholder leaves
+)
+
+
 def _check_dataclass_annotations(self, typechecker):
     if not any(
-        frame.frame.f_globals.get("__name__") in {"jax._src.tree_util", "flax.nnx.transforms.compilation"}
-        for frame in inspect.stack()
+        str(frame.frame.f_globals.get("__name__", "")).startswith(_TREE_MANIPULATION_MODULES) for frame in inspect.stack()
     ):
         return _original_check_dataclass_annotations(self, typechecker)
     return None
