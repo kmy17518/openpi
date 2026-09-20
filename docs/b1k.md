@@ -494,6 +494,21 @@ Not ported, because the code they fix does not exist here or is the performance 
 
 ---
 
+### Goal-image conditioning (`goal` branch: PI-SLOT, PI-ROLE, prompt scaffolds)
+
+The `goal` branch (from `my-clean@81d349e`) extends π₀.₅ through its existing image-token pathway, following ForeAct's additional visual-goal input with VISTA's explicit observation/goal token concatenation as the multi-view reference. It is a mechanism reproduction inside this fork, not a reproduction of either hierarchical system; the checkpoint (`pi05_base`), action horizon (32), optimizer and fine-tuning scope of `pi05_b1k` are unchanged. **Only the JAX model is extended**; the PyTorch backend (`models_pytorch/pi0_pytorch.py`) and π₀-FAST are untouched and not claimed to support goals. The preset has been validated on CPU (tests, data path on the merged root) but **has not been trained or served on a GPU in this workspace**.
+
+- **Data.** `RobotConfig.goals` (R1Pro: `goal_image_0/1/2` = head / left-wrist / right-wrist goal; wire key `goal::<camera observation key>`, dataset key `observation.goal_rgb.<camera>_camera_0`). `--data.goal-views goal_image_0 [...]` decodes those streams (added to `video_keys`, never through the camera enumeration) and `B1KInputs` emits them as the model's goal slots `goal_0_rgb, goal_1_rgb, ...` (`models.model.GOAL_IMAGE_KEYS`, fixed order after the three cameras, masks True). The goal source here is the dataset's goal stream (the radio skill-segment datasets: the episode's last frame); a generic "last frame of the episode" source would need a per-episode table in `B1KLeRobotDataset` and is not implemented for openpi.
+- **PI-SLOT** (`--model.goal-image-keys goal_0_rgb`): the goal image is encoded by the existing SigLIP encoder and appended to the visual prefix; one 224 px image adds 256 tokens (measured in the tests: prefix = 4 × 256 + prompt tokens with one goal slot). No new parameters, so `pi05_base` loads unchanged. `Pi0.embed_prefix` iterates the configured key order explicitly (JAX tree utilities sort dict keys, which would otherwise move `goal_0_rgb` ahead of the wrist cameras) and `preprocess_observation` runs over the extended key set; augmax draws every image's crop/rotation/color jitter from the same per-sample key, so a goal and its camera receive matched transforms.
+- **PI-ROLE** (`--model.goal-role-embedding`): a learned VLM-width vector, zero-initialized, added to every token of every goal image after the image projection; saved/restored with the model state (`goal_role_embed`), kept at zero when absent from the loaded params. Our improvement to test, not a verified component of ForeAct or VISTA.
+- **Regimes and prompts** (`--data.conditioning-regime none|language|image|image_language`): `none`/`image` prompt with a fixed task-independent scaffold only (`Perform the task.` / `Reach the configuration shown in the goal image.`), `language`/`image_language` append the task prompt (`--data.prompt-source`) to the scaffold; `transforms.ComposePrompt` runs in training and serving alike. The π₀.₅ discretized state tokens are preserved in every regime. The data config rejects goal views the model does not declare and regimes that disagree with the goal views.
+- **Serving.** `b1k_metadata.json` records `conditioning` (regime, goal views, goal slots, role flag); `serve_b1k.py` restores the model slots and the data config's goal views/regime from it, and `B1KPolicyWrapper` reads goal images from the request (`goal::<camera key>`) or from fixed `--goal-image goal_image_0=PATH` files.
+- **Recipe.** `scripts/b1k/run_navpickup_conditioning.sh` (`PI_CONDITION=none|language|image|image_language`, `PI_ROLE=1`, `PI_GOAL_VIEWS`) wraps `launch.sh` for the merged nav+pickup root (norm stats for that root must be computed first, see the script header). Tests: `src/openpi/policies/b1k_goal_test.py`.
+
+Next steps the plan lists but this branch does not include: the two wrist goal slots as an independent multi-view experiment (the slots exist; VISTA-style six-image layouts remain an adaptation), six-channel SigLIP inputs (deliberately not attempted), and relative-pose text prediction.
+
+---
+
 ### Quick reference
 
 | Item | Value |
