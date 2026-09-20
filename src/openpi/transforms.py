@@ -353,6 +353,30 @@ class ExtractFASTActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class ComposePrompt(DataTransformFn):
+    """Compose the policy prompt from a fixed scaffold and, optionally, the task-dependent text (goal-image conditioning).
+
+    Regimes: `scaffold` alone removes every task-dependent word from the prompt (N and I: "image-only means no
+    task-dependent language information; it need not mean an empty token sequence"); `include_task` appends the
+    task prompt after the scaffold (L and LI). Applied both in training and in serving, so the wording is identical.
+    """
+
+    scaffold: str
+    include_task: bool
+
+    def __call__(self, data: DataDict) -> DataDict:
+        task = data.get("prompt")
+        if self.include_task:
+            if task is None:
+                raise ValueError("ComposePrompt(include_task=True) needs the task prompt in the data")
+            task = task if isinstance(task, str) else np.asarray(task).item()
+            data["prompt"] = f"{self.scaffold} {task}".strip()
+        else:
+            data["prompt"] = self.scaffold
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
     """Extracts a prompt from the current LeRobot dataset task."""
 

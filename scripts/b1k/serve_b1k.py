@@ -52,6 +52,9 @@ class Args:
     text_prompt: str | None = None
     # Explicit budget for older checkpoints; new checkpoints restore their training value.
     max_token_len: int | None = None
+    # Goal-conditioned checkpoints: fixed goal image per robot-config goal view, `goal_image_0=PATH` (PNG/JPEG, RGB),
+    # used when a request carries no goal::<camera key> image; repeat per view.
+    goal_image: list[str] | None = None
     # Permit unversioned artifacts only after verifying their action representation matches --robot.
     allow_legacy_assets: bool = False
     control_mode: str = "receding_horizon"
@@ -162,6 +165,18 @@ def main(args: Args) -> None:
     config = dataclasses.replace(
         config, model=_b1k_artifacts.restore_model_config(config.model, metadata, max_token_len=args.max_token_len)
     )
+    conditioning = (metadata or {}).get("conditioning")
+    if conditioning is not None:
+        # Restore the goal views / prompt regime the checkpoint trained with (the model's goal slots come from
+        # restore_model_config above); the data config validates that both agree.
+        config = dataclasses.replace(
+            config,
+            data=dataclasses.replace(
+                config.data,
+                goal_views=tuple(conditioning.get("goal_views") or ()),
+                conditioning_regime=conditioning.get("regime"),
+            ),
+        )
     if not 1 <= args.action_horizon <= config.model.action_horizon:
         raise ValueError(f"Require 1 <= --action-horizon <= prediction horizon {config.model.action_horizon}")
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -191,6 +206,19 @@ def main(args: Args) -> None:
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
+    fixed_goals = {}
+    for spec in args.goal_image or []:
+        view, _, path = spec.partition("=")
+        if not path or view not in ROBOT_REGISTRY[args.robot].goals:
+            raise ValueError(f"--goal-image expects <goal view>=PATH with a robot-config goal view, got {spec!r}")
+        import av
+
+        with av.open(path) as container:
+            fixed_goals[view] = next(container.decode(video=0)).to_ndarray(format="rgb24")
+    if data_config.goal_views:
+        logging.info("Goal-conditioned policy: views %s (regime %s), fixed goal images for %s",
+                     list(data_config.goal_views), data_config.conditioning_regime, sorted(fixed_goals))
+
     policy = B1KPolicyWrapper(
         policy=policy,
         robot=args.robot,
@@ -198,6 +226,8 @@ def main(args: Args) -> None:
         control_mode=args.control_mode,
         action_horizon=args.action_horizon,
         max_len=config.model.action_horizon,
+        goal_views=tuple(data_config.goal_views),
+        fixed_goals=fixed_goals,
     )
 
     hostname = socket.gethostname()

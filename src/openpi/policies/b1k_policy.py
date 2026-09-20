@@ -58,6 +58,10 @@ class B1KInputs(transforms.DataTransformFn):
     # Robot configuration object
     robot_config: RobotConfig = dataclasses.field(default=None)
 
+    # Goal-image conditioning: robot-config goal views ("goal_image_0", ...) read from `observation/<key>` and
+    # emitted as the model's goal image slots (_model.GOAL_IMAGE_KEYS, same order), masks True. Empty = no goals.
+    goal_views: tuple[str, ...] = ()
+
     def __call__(self, data: dict) -> dict:
         proprio_data = data["observation/state"]
         # extract joint position
@@ -77,9 +81,16 @@ class B1KInputs(transforms.DataTransformFn):
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+                for view, slot in zip(self.goal_views, _model.GOAL_IMAGE_KEYS[: len(self.goal_views)], strict=True):
+                    # goal slots after the cameras, in the fixed slot order; one image per sample, no history axis
+                    images.append(_parse_image(data[f"observation/{view}"]))
+                    image_masks.append(np.True_)
+                    names += (slot,)
                 images = tuple(images)
                 image_masks = tuple(image_masks)
             case _model.ModelType.PI0_FAST:
+                if self.goal_views:
+                    raise ValueError("Goal-image slots are implemented for the pi0 / pi05 models, not pi0-FAST")
                 names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
                 # We don't mask out padding images for FAST models.
                 images = tuple(images)

@@ -129,6 +129,9 @@ class DataConfig:
     # Permit norm stats / checkpoints without `b1k_metadata.json` (computed before it existed). A recorded mismatch is
     # never bypassed.
     allow_legacy_assets: bool = False
+    # Goal-image conditioning as resolved by LeRobotB1KDataConfig (recorded into checkpoints; see that class).
+    goal_views: Sequence[str] = ()
+    conditioning_regime: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -393,6 +396,11 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         )
 
 
+# Prompt scaffolds of the conditioning regimes (docs/b1k.md "Goal-image conditioning"): fixed, task-independent text.
+GOAL_PROMPT_SCAFFOLD = "Reach the configuration shown in the goal image."
+PLAIN_PROMPT_SCAFFOLD = "Perform the task."
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotB1KDataConfig(DataConfigFactory):
     robot_config_name: str = tyro.MISSING
@@ -416,6 +424,14 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # Permit unversioned norm stats / checkpoints (no `b1k_metadata.json`) only after checking their robot/action
     # convention yourself; a recorded mismatch is never bypassed. CLI: --data.allow-legacy-assets
     allow_legacy_assets: bool = False
+    # Goal-image conditioning (docs/b1k.md "Goal-image conditioning"). `goal_views` names robot-config goal views
+    # ("goal_image_0" = head goal, "goal_image_1" / "goal_image_2" = wrist goals); their dataset streams are decoded and
+    # fed to the model's goal image slots, which the model config must declare (`--model.goal-image-keys`, one per
+    # view, in this order). `conditioning_regime` fixes the prompt: none / image use the fixed task-independent scaffold
+    # only, language / image_language the scaffold plus the task prompt (`prompt_source`). CLI:
+    #   --data.goal-views goal_image_0 --data.conditioning-regime image --model.goal-image-keys goal_0_rgb
+    goal_views: Sequence[str] = ()
+    conditioning_regime: Literal["none", "language", "image", "image_language"] | None = None
 
     @override
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -485,6 +501,26 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 repack_mapping[f"observation/{image_key}"] = robot_config.observations[image_key].dataset_key
                 camera_keys.append(robot_config.observations[image_key].dataset_key)
 
+        # Goal-image views: decoded from their own dataset streams, never through the camera enumeration above.
+        goal_views = tuple(self.goal_views)
+        if len(set(goal_views)) != len(goal_views) or set(goal_views) - set(robot_config.goals):
+            raise ValueError(f"goal_views must be distinct entries of the robot config's goals {list(robot_config.goals)}")
+        expected_goal_keys = _model.GOAL_IMAGE_KEYS[: len(goal_views)]
+        model_goal_keys = tuple(getattr(model_config, "goal_image_keys", ()))
+        if model_goal_keys != expected_goal_keys:
+            raise ValueError(
+                f"Data config goal_views {list(goal_views)} need model goal_image_keys {list(expected_goal_keys)}, "
+                f"got {list(model_goal_keys)} (pass --model.goal-image-keys accordingly)"
+            )
+        for view in goal_views:
+            repack_mapping[f"observation/{view}"] = robot_config.goals[view].dataset_key
+            camera_keys.append(robot_config.goals[view].dataset_key)
+        regime = self.conditioning_regime
+        if regime is not None:
+            wants_goal = regime in ("image", "image_language")
+            if wants_goal != bool(goal_views):
+                raise ValueError(f"conditioning_regime {regime} {'requires' if wants_goal else 'excludes'} goal_views")
+
         # Add non-image observations
         repack_mapping.update(
             {
@@ -499,9 +535,15 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         # Prepare data for policy training
         # Convert images to uint8 numpy arrays, add masks
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1KInputs(robot_config=robot_config, model_type=model_config.model_type)],
+            inputs=[b1k_policy.B1KInputs(robot_config=robot_config, model_type=model_config.model_type, goal_views=goal_views)],
             outputs=[b1k_policy.B1KOutputs(action_dim=robot_config.action_dim)],
         )
+        if regime is not None:
+            # The prompt scaffold is fixed and task-independent; task-dependent text only enters in the language regimes.
+            scaffold = GOAL_PROMPT_SCAFFOLD if goal_views else PLAIN_PROMPT_SCAFFOLD
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.ComposePrompt(scaffold, include_task=regime in ("language", "image_language"))]
+            )
 
         # extra delta transform.
         if self.extra_delta_transform:
@@ -530,6 +572,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 robot_config, extra_delta_transform=self.extra_delta_transform
             ),
             allow_legacy_assets=self.allow_legacy_assets,
+            goal_views=goal_views,
+            conditioning_regime=regime,
             dataset_kwargs=dataset_kwargs,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,

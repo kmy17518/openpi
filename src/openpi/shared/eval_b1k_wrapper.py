@@ -16,10 +16,19 @@ class B1KPolicyWrapper:
         action_horizon: int,
         max_len: int,
         obs_size: tuple[int, int] = (224, 224),
+        goal_views: tuple[str, ...] = (),
+        fixed_goals: dict[str, np.ndarray] | None = None,
     ) -> None:
         # Load robot config from registry
         self.robot = ROBOT_REGISTRY[robot]
         self.policy = policy
+        # Goal-image conditioning: robot-config goal views the checkpoint consumes, read from the request under their
+        # `obs_key` (goal::<camera key>) or, when absent, from the fixed images given at server start (--goal-image).
+        self.goal_views = tuple(goal_views)
+        unknown = set(self.goal_views) - set(self.robot.goals)
+        if unknown:
+            raise ValueError(f"Unknown goal views {sorted(unknown)}; robot config defines {list(self.robot.goals)}")
+        self.fixed_goals = {view: np.asarray(image) for view, image in (fixed_goals or {}).items() if view in self.goal_views}
         self.text_prompt = text_prompt
         self.control_mode = control_mode
         self.action_horizon = action_horizon
@@ -96,11 +105,28 @@ class B1KPolicyWrapper:
         while len(observations) < 3:
             observations.append(np.zeros((batch_size, *self.obs_size, 3), dtype=np.uint8))
         img_obs = np.stack(observations, axis=1)  # Shape: (B, 3, H, W, C)
+        goals = {}
+        for view in self.goal_views:
+            key = self.robot.goals[view].obs_key
+            if key in obs:
+                goal_obs = np.asarray(obs[key])
+                if goal_obs.ndim not in (3, 4) or goal_obs.shape[-1] < 3:
+                    raise ValueError(f"Goal image {view!r} must have shape (H, W, C) or (B, H, W, C)")
+                if goal_obs.ndim == 3:
+                    goal_obs = goal_obs[None, ...]
+                if goal_obs.shape[0] != batch_size:
+                    raise ValueError(f"Goal image {view!r} batch size does not match proprioception")
+            elif view in self.fixed_goals:
+                goal_obs = np.broadcast_to(self.fixed_goals[view], (batch_size, *self.fixed_goals[view].shape))
+            else:
+                raise ValueError(f"Goal-conditioned policy needs {key!r} in the observation (or a fixed --goal-image)")
+            goals[view] = resize_with_pad(goal_obs[..., :3], *self.obs_size)
         processed_input = [
             {
                 "observation/image_0": img_obs[i, 0],
                 "observation/image_1": img_obs[i, 1],
                 "observation/image_2": img_obs[i, 2],
+                **{f"observation/{view}": goals[view][i] for view in self.goal_views},
                 "observation/state": prop_state[i],
                 "prompt": self.text_prompt,
             }

@@ -17,6 +17,8 @@ MODEL_FIELDS = (
     "discrete_state_input",
     "paligemma_variant",
     "action_expert_variant",
+    "goal_image_keys",
+    "goal_role_embedding",
 )
 
 
@@ -73,8 +75,17 @@ def inference_metadata(data_config: Any, model_config: Any, prompts: dict[str, s
     metadata.update(
         prompt_source=data_config.prompt_source,
         task_prompts=prompts,
+        conditioning={
+            "regime": getattr(data_config, "conditioning_regime", None),
+            "goal_views": list(getattr(data_config, "goal_views", ()) or ()),
+            "goal_image_keys": list(getattr(model_config, "goal_image_keys", ()) or ()),
+            "goal_role_embedding": bool(getattr(model_config, "goal_role_embedding", False)),
+            "goal_source": "dataset_goal_stream" if getattr(data_config, "goal_views", ()) else None,
+        },
         model_type=model_config.model_type.value,
-        model={field: getattr(model_config, field) for field in MODEL_FIELDS if hasattr(model_config, field)},
+        # tuples become lists so the record equals its JSON round trip
+        model={field: (list(value) if isinstance(value, tuple) else value)
+               for field in MODEL_FIELDS if hasattr(model_config, field) for value in [getattr(model_config, field)]},
     )
     return metadata
 
