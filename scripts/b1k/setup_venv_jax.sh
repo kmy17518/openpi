@@ -112,7 +112,11 @@ EOF_OVR
 
 (
     cd "$SCRATCH"
+    # --no-sources: lerobot's pyproject pins torch/torchvision to PyTorch's *cu128* index through [tool.uv.sources],
+    # and uv applies a git dependency's sources; under that pin torch==2.10.0+cu130 has "no version". Ignore them so
+    # torch comes from the cu130 index given here.
     uv pip install --python "$PY" \
+        --no-sources \
         --index-strategy unsafe-best-match \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
         --override overrides.txt \
