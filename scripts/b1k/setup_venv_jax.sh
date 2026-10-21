@@ -87,6 +87,9 @@ websockets>=14
 msgpack>=1.0
 pytest>=8.3.4
 pynvml>=12
+
+# train_b1k.py's val/actions figures
+matplotlib>=3.10.0
 EOF_REQ
 
 # `--override`: replaces version constraints declared by other packages.

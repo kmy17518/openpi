@@ -725,6 +725,115 @@ def test_spread_frame_indices_cover_every_episode_and_repeat_with_the_seed():
         b1k_dataset.spread_frame_indices([0, 1, 0], 2, seed=0)
 
 
+def test_figure_frame_indices_pick_different_episodes_and_repeat_with_the_seed():
+    episode_index = np.repeat([7, 3, 9, 4, 5, 8], [12, 12, 3, 30, 5, 9])
+    rows = b1k_dataset.figure_frame_indices(episode_index, 4, seed=0)
+    assert len(set(episode_index[rows].tolist())) == 4
+    assert rows == b1k_dataset.figure_frame_indices(episode_index, 4, seed=0)
+    assert rows != b1k_dataset.figure_frame_indices(episode_index, 4, seed=1)
+    every_episode = b1k_dataset.figure_frame_indices(episode_index, 9, seed=0)
+    assert set(episode_index[every_episode].tolist()) == {3, 4, 5, 7, 8, 9}
+
+
+# Validation episodes of ACT's resolve_val_split (act b1k_training.py) for these tasks, sizes and seeds, computed with
+# ACT's own function on a catalog of these episodes.
+_ACT_TASKS = {0: "picking_up_trash", 1: "iors_small-turning_on_radio", 2: "chop_an_onion", 3: "x"}
+_ACT_SIZES = {0: 2, 1: 7, 2: 25, 3: 131}
+_ACT_BASES = {0: 40, 1: 0, 2: 500, 3: 2000}
+# fmt: off
+_ACT_VAL_EPISODES = {
+    (0, 0.1): {
+        "picking_up_trash": [40],
+        "iors_small-turning_on_radio": [12],
+        "chop_an_onion": [522, 542],
+        "x": [2000, 2010, 2082, 2102, 2136, 2138, 2150, 2178, 2234, 2240, 2286, 2306, 2340],
+    },
+    (0, 0.3): {
+        "picking_up_trash": [40],
+        "iors_small-turning_on_radio": [12, 16],
+        "chop_an_onion": [510, 522, 534, 542, 548, 558, 566, 570],
+        "x": [2000, 2004, 2010, 2016, 2036, 2048, 2066, 2070, 2076, 2082, 2102, 2106, 2124, 2136, 2138, 2150, 2166,
+              2172, 2178, 2190, 2192, 2198, 2204, 2216, 2228, 2234, 2240, 2286, 2294, 2306, 2310, 2318, 2322, 2324,
+              2328, 2330, 2340, 2346, 2364],
+    },
+    (42, 0.1): {
+        "picking_up_trash": [40],
+        "iors_small-turning_on_radio": [4],
+        "chop_an_onion": [510, 516],
+        "x": [2042, 2046, 2130, 2144, 2178, 2214, 2216, 2222, 2246, 2300, 2352, 2378, 2388],
+    },
+    (42, 0.3): {
+        "picking_up_trash": [40],
+        "iors_small-turning_on_radio": [4, 16],
+        "chop_an_onion": [510, 516, 518, 528, 536, 564, 566, 572],
+        "x": [2040, 2042, 2046, 2058, 2070, 2078, 2096, 2124, 2126, 2130, 2136, 2138, 2144, 2160, 2178, 2186, 2192,
+              2210, 2214, 2216, 2222, 2226, 2228, 2246, 2270, 2276, 2280, 2300, 2318, 2322, 2334, 2352, 2354, 2358,
+              2364, 2370, 2378, 2388, 2390],
+    },
+}
+# fmt: on
+
+
+@pytest.mark.parametrize(("seed", "fraction"), list(_ACT_VAL_EPISODES))
+def test_val_split_matches_act(seed: int, fraction: float):
+    episodes = {
+        _ACT_TASKS[task]: [_ACT_BASES[task] + 3 * k + k % 2 for k in range(size)] for task, size in _ACT_SIZES.items()
+    }
+    split = b1k_dataset.split_val_episodes(episodes, fraction, seed)
+    assert {name: entry["val"] for name, entry in split.items()} == _ACT_VAL_EPISODES[(seed, fraction)]
+    for name, entry in split.items():
+        assert sorted(entry["train"] + entry["val"]) == episodes[name]
+    with pytest.raises(ValueError, match="at least 2"):
+        b1k_dataset.split_val_episodes({"one": [3]}, fraction, seed)
+    with pytest.raises(ValueError, match="val-fraction"):
+        b1k_dataset.split_val_episodes(episodes, 1.0, seed)
+
+
+def test_val_fraction_splits_training_and_validation_episodes(full_root: pathlib.Path, monkeypatch):
+    from openpi.training import config
+    from openpi.training import data_loader
+    from scripts import compute_norm_stats
+
+    tasks = ["turning_on_radio", "picking_up_trash", "chop_an_onion"]
+    dc = config.DataConfig(
+        repo_id="org/demos",
+        dataset_root=str(full_root),
+        task_names=tasks,
+        action_sequence_keys=("action",),
+        val_fraction=0.5,
+        val_seed=3,
+    )
+    meta = b1k_dataset.B1KDatasetMetadata("org/demos", full_root)
+    split = b1k_dataset.resolve_val_split(meta, tasks, 0.5, 3)
+    assert split["format"] == "isg-val-split/v1"
+    assert len(split["val_episodes"]) == 3
+    assert sorted(split["train_episodes"] + split["val_episodes"]) == [0, 1, 2, 3, 4, 5]
+    expected = b1k_dataset.split_val_episodes({"picking_up_trash": [2, 3]}, 0.5, 3)
+    assert split["tasks"]["picking_up_trash"] == expected["picking_up_trash"]
+    assert data_loader.create_b1k_dataset(dc, HORIZON).episodes == split["train_episodes"]
+    assert data_loader.create_b1k_dataset(dc, HORIZON, subset="val").episodes == split["val_episodes"]
+    reader = mock.Mock()
+    monkeypatch.setattr(compute_norm_stats._lerobot_lowdim, "LowDimLeRobotDataset", reader)  # noqa: SLF001
+    compute_norm_stats._create_lowdim_dataset(dc, HORIZON)  # noqa: SLF001
+    assert reader.call_args.kwargs["episodes"] == split["train_episodes"]
+    assert b1k_dataset.resolve_val_split(meta, tasks, 0.0, 3) is None
+    with pytest.raises(ValueError, match="need --data.val-fraction"):
+        data_loader.create_b1k_dataset(dataclasses.replace(dc, val_fraction=0.0), HORIZON, subset="val")
+    assert b1k_dataset.task_subset_asset_id("org/demos", ["b"], gripper_action="delta", val_fraction=0.1, seed=7) == (
+        "org/demos/task_subsets/b/gripper_action/delta/val_fraction/0.1/seed/7"
+    )
+
+
+def test_train_config_seed_selects_the_validation_split():
+    from openpi.training import config
+
+    train_config = config.get_config("pi05_b1k")
+    assert dataclasses.replace(train_config, seed=5).data.val_seed == 5
+    seeded = dataclasses.replace(train_config, seed=5, data=dataclasses.replace(train_config.data, val_fraction=0.1))
+    assert seeded.data.val_seed == 5
+    assert seeded.data.val_fraction == 0.1
+
+
 def test_action_is_pad_reaches_the_training_batch_and_flags_the_program_end(tmp_path: pathlib.Path, monkeypatch):
     from lerobot.datasets import dataset_reader
     from openpi.training import config

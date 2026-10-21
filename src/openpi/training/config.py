@@ -134,6 +134,10 @@ class DataConfig:
     # program length, read from `<dataset_root>/isg_meta/settle_windows.json`).
     episode_split: str = "auto"
     settle_steps: str = "all"
+    # Fraction of each task's episodes held out for validation (0: none) and the seed of that split (see
+    # LeRobotB1KDataConfig.val_fraction).
+    val_fraction: float = 0.0
+    val_seed: int | None = None
     # Goal-image conditioning as resolved by LeRobotB1KDataConfig (recorded into checkpoints; see that class).
     goal_views: Sequence[str] = ()
     goal_source: _b1k_dataset.GoalSource | None = None
@@ -439,6 +443,13 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # keeps the program only) or a decimal fraction of the program length (`0.2`), capped at the recorded window.
     # Goal images (`goal_source="episode_last"`) stay the last recorded frame. CLI: --data.settle-steps SPEC
     settle_steps: str | None = None
+    # Hold out round(N * fraction) of each selected task's N episodes (at least 1, at most N - 1; among the episode
+    # split's train episodes when there is one) for validation: the same episodes as ACT's --val-fraction for the
+    # same --seed. Training and norm stats exclude them (asset id `.../val_fraction/<fraction>/seed/<seed>`) and they
+    # are the default validation data. CLI: --data.val-fraction 0.1
+    val_fraction: float | None = None
+    # TrainConfig.seed, set by TrainConfig.
+    val_seed: tyro.conf.Suppress[int | None] = None
     # Goal-image conditioning (docs/b1k.md "Goal-image conditioning"). `goal_views` names robot-config goal views
     # ("goal_image_0" = head goal, "goal_image_1" / "goal_image_2" = wrist goals); their goal images are fed to the
     # model's goal image slots, which the model config must declare (`--model.goal-image-keys`, one per view, in this
@@ -473,6 +484,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             self.settle_steps if self.settle_steps is not None else base_config.settle_steps
         )
         prompt_source = self.prompt_source if self.prompt_source is not None else base_config.prompt_source
+        val_fraction = self.val_fraction if self.val_fraction is not None else base_config.val_fraction
+        val_seed = self.val_seed if self.val_seed is not None else base_config.val_seed
         asset_id = self.assets.asset_id
         if asset_id is None and repo_id is not None:
             # A task subset / settle-steps setting has its own norm stats (`<repo_id>` for the whole dataset at `all`).
@@ -480,7 +493,12 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 repo_id
                 if isinstance(repo_id, list)
                 else _b1k_dataset.task_subset_asset_id(
-                    repo_id, task_names, settle_steps=settle_steps, gripper_action=self.gripper_action
+                    repo_id,
+                    task_names,
+                    settle_steps=settle_steps,
+                    gripper_action=self.gripper_action,
+                    val_fraction=val_fraction,
+                    seed=val_seed,
                 )
             )
         assets_dir = epath.Path(self.assets.assets_dir or assets_dirs)
@@ -496,6 +514,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             task_names=task_names,
             episode_split=episode_split,
             settle_steps=settle_steps,
+            val_fraction=val_fraction,
+            val_seed=val_seed,
             prompt_source=prompt_source,
             norm_stats=self._load_norm_stats(assets_dir, asset_id),
             norm_stats_metadata=norm_stats_metadata,
@@ -859,7 +879,7 @@ class TrainConfig:
     val_num_batches: int = 10
     # Validate on the `held_out` episodes of the training data's episode split (`--data.episode-split`; tasks without
     # held-out episodes are skipped), with the training repo_id, dataset_root, task_names, settle_steps, goal settings
-    # and norm stats. Otherwise validation needs --val-repo-id. CLI: --val-held-out
+    # and norm stats. Otherwise validation uses --val-repo-id, else the --data.val-fraction episodes. CLI: --val-held-out
     val_held_out: bool = False
     # Optionally, repo_id for validation set (if different from train)
     val_repo_id: str | None = None
@@ -885,6 +905,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if isinstance(self.data, LeRobotB1KDataConfig) and self.data.val_seed != self.seed:
+            object.__setattr__(self, "data", dataclasses.replace(self.data, val_seed=self.seed))
 
 
 # Use `get_config` if you need to get a config by name in your code.
