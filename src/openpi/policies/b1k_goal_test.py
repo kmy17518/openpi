@@ -116,7 +116,7 @@ def test_b1k_data_config_validates_goal_views_against_the_model_and_regime(tmp_p
               "observation.rgb.right_realsense_link_camera_0": np.zeros((240, 240, 3), np.uint8),
               "observation.goal_rgb.zed_link_camera_0": np.full((240, 240, 3), 7, np.uint8),
               "observation.state": np.zeros(61, np.float32), "action": np.zeros((32, 23), np.float32),
-              "prompt": "turning_on_radio-pick_up_radio"}
+              "action_is_pad": np.zeros(32, bool), "prompt": "turning_on_radio-pick_up_radio"}
     out = sample
     for transform in [*config.repack_transforms.inputs, *config.data_transforms.inputs]:
         out = transform(out)

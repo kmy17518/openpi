@@ -7,6 +7,7 @@ import tyro
 
 from openpi.configs.robots import ROBOT_REGISTRY
 from openpi.configs.tasks import TASK_REGISTRY
+from openpi.policies import b1k_policy as _b1k_policy
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_b1k_server
@@ -46,6 +47,11 @@ class Args:
     # Settle-window setting the checkpoint was trained on (`--data.settle-steps` of train_b1k.py); selects that
     # setting's norm stats inside the checkpoint assets when multiple assets exist.
     settle_steps: str | None = None
+    # Gripper action representation (`--data.gripper-action` of train_b1k.py). Default: what the checkpoint records.
+    gripper_action: _b1k_policy.GripperAction | None = None
+    # Served gripper commands (dims 14 and 22) are clamped to [-1, 1] and set to +1 (open) above this threshold;
+    # None serves the model's values. Recorded in the server metadata.
+    gripper_snap_threshold: float | None = _b1k_policy.DEFAULT_GRIPPER_SNAP_THRESHOLD
     # Which text of the task to prompt the policy with: `task_name` (the snake_case id of `--task`, e.g.
     # `turning_on_radio`) or `task_description` (its natural-language instruction from the task registry,
     # `configs/tasks/b1k.py`). Default: what the checkpoint was trained with (`--data.prompt-source` of train_b1k.py,
@@ -97,7 +103,7 @@ def resolve_assets_dir(config: _config.TrainConfig, checkpoint_dir: str) -> path
     if len(candidates) == 1:
         logging.warning(
             "Norm stats not found at %s; serving the checkpoint's only norm stats (%s). Pass --repo-id / --task-names "
-            "matching the training run to silence this.",
+            "/ --settle-steps / --gripper-action matching the training run to silence this.",
             requested,
             found[0],
         )
@@ -160,6 +166,8 @@ def main(args: Args) -> None:
             robot_config_name=args.robot,
             task_names=args.task_names,
             settle_steps=args.settle_steps,
+            gripper_action=args.gripper_action or "absolute",
+            gripper_snap_threshold=args.gripper_snap_threshold,
             allow_legacy_assets=args.allow_legacy_assets,
         ),
     )
@@ -169,6 +177,9 @@ def main(args: Args) -> None:
     config = dataclasses.replace(
         config, model=_b1k_artifacts.restore_model_config(config.model, metadata, max_token_len=args.max_token_len)
     )
+    if args.gripper_action is None and metadata is not None:
+        recorded_gripper_action = metadata["action_representation"].get("gripper_action", "absolute")
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, gripper_action=recorded_gripper_action))
     conditioning = (metadata or {}).get("conditioning")
     if conditioning is not None:
         # Restore the goal views / prompt regime / settle steps the checkpoint trained with (the model's goal slots
@@ -210,7 +221,16 @@ def main(args: Args) -> None:
         b1k_metadata=metadata,
         max_token_len=args.max_token_len,
     )
-    policy_metadata = policy.metadata
+    snap = args.gripper_snap_threshold
+    gripper_dims = [i for group in ROBOT_REGISTRY[args.robot].action if group.is_eef for i in group.indices]
+    policy_metadata = {
+        **(policy.metadata or {}),
+        "gripper_action": config.data.gripper_action,
+        "gripper_action_dims": gripper_dims,
+        "gripper_clamp": None if snap is None else [-1.0, 1.0],
+        "gripper_snap_threshold": snap,
+    }
+    logging.info("Server metadata: %s", policy_metadata)
 
     # Record the policy's behavior.
     if args.record:

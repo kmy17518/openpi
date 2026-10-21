@@ -75,6 +75,7 @@ DEFAULT_GOAL_SOURCE: GoalSource = "episode_last"
 
 EPISODE_SPLIT_FILE = "isg_meta/train_split.json"
 EPISODE_SPLIT_FORMAT = "isg-episode-split/v1"
+EPISODE_SPLIT_SUBSETS = ("train", "held_out")
 TASK_GROUPS_FILE = "isg_meta/task_groups.json"
 TASK_GROUPS_FORMAT = "isg-task-groups/v1"
 SETTLE_WINDOWS_FILE = "isg_meta/settle_windows.json"
@@ -85,6 +86,7 @@ SETTLE_WINDOWS_FORMAT = "isg-settle-windows/v1"
 # subsets of the same dataset do not clobber each other.
 TASK_SUBSETS_DIR_NAME = "task_subsets"
 SETTLE_STEPS_DIR_NAME = "settle_steps"
+GRIPPER_ACTION_DIR_NAME = "gripper_action"
 _TASK_SUBSET_KEY_SEPARATOR = "+"
 _TASK_SUBSET_KEY_SAFE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
 _TASK_SUBSET_KEY_MAX_LEN = 96
@@ -140,14 +142,19 @@ def resolve_episode_split(
     dataset_path: str | pathlib.Path | None,
     spec: str = "auto",
     task_names: str | Iterable[str] | None = None,
+    *,
+    subset: str = "train",
 ) -> dict[str, Any] | None:
     """Training episodes of ``--data.episode-split SPEC`` as a JSON-serializable record, or None without a split.
 
     ``auto`` reads ``<root>/isg_meta/train_split.json`` when that file exists (no split otherwise), ``none``
     disables the split, any other value is the path of a split file. The selected tasks are ``task_names``
     (expanded through ``isg_meta/task_groups.json`` when present) or, when omitted, every task of the file;
-    the episodes are the sorted union of their ``train`` lists.
+    the episodes are the sorted union of their ``subset`` lists (``train``, or ``held_out`` for validation, which
+    skips the selected tasks that have no held-out episode with a warning).
     """
+    if subset not in EPISODE_SPLIT_SUBSETS:
+        raise ValueError(f"Episode split subset must be one of {EPISODE_SPLIT_SUBSETS}, got {subset!r}")
     if spec == "none" or dataset_path is None:
         if spec not in ("auto", "none") and dataset_path is None:
             path = pathlib.Path(spec)
@@ -169,16 +176,61 @@ def resolve_episode_split(
     missing = [name for name in tasks if name not in split["tasks"]]
     if missing:
         raise ValueError(f"Selected tasks {missing} have no entry in episode split {path}")
-    episodes = sorted({int(episode) for name in tasks for episode in split["tasks"][name]["train"]})
+    if subset == "held_out":
+        if empty := [name for name in tasks if not split["tasks"][name].get(subset)]:
+            logging.warning("Tasks %s have no held-out episodes in %s; validating without them", empty, path)
+            tasks = [name for name in tasks if name not in empty]
+        if not tasks:
+            raise ValueError(f"None of the selected tasks has held-out episodes in {path}")
+    episodes = sorted({int(episode) for name in tasks for episode in split["tasks"][name][subset]})
     return {
         "file": str(path),
         "sha256": hashlib.sha256(content).hexdigest(),
         "format": split["format"],
         "name": split.get("name"),
-        "subset": "train",
+        "subset": subset,
         "tasks": tasks,
         "episodes": episodes,
     }
+
+
+def spread_frame_indices(episode_index: Sequence[int] | np.ndarray, count: int, seed: int) -> list[int]:
+    """``count`` distinct row positions spread over every episode, the same for the same rows and ``seed``.
+
+    ``episode_index`` is the episode of each row (rows of an episode contiguous). Each episode gets a share of
+    ``count`` proportional to its length (at least one row while ``count`` covers every episode); its rows are
+    drawn one per equal-length stretch of the episode at a seeded offset. Every row when ``count`` covers them all.
+    """
+    episode_index = np.asarray(episode_index)
+    if count >= len(episode_index):
+        return list(range(len(episode_index)))
+    _, starts, lengths = np.unique(episode_index, return_index=True, return_counts=True)
+    order = np.argsort(starts)
+    starts, lengths = starts[order], lengths[order]
+    if np.any(np.diff(starts) != lengths[:-1]):
+        raise ValueError("Rows of an episode must be contiguous")
+    share = count * lengths / lengths.sum()
+    quota = np.floor(share).astype(int)
+    if count >= len(lengths):
+        quota = np.maximum(quota, 1)
+    # Hand out what is left to the largest remainders (taking back from the largest shares when the minimum of one
+    # row per episode overshoots), never beyond an episode's length.
+    while (left := count - quota.sum()) != 0:
+        if left > 0:
+            room = np.where(quota < lengths, share - quota, -np.inf)
+            quota[int(np.argmax(room))] += 1
+        else:
+            spare = np.where(quota > 1, quota - share, -np.inf)
+            quota[int(np.argmax(spare))] -= 1
+    rng = np.random.default_rng(seed)
+    rows: list[int] = []
+    for start, length, n in zip(starts, lengths, quota, strict=True):
+        if n == 0:
+            continue
+        edges = np.linspace(0, length, n + 1)
+        low, high = np.ceil(edges[:-1]).astype(int), np.ceil(edges[1:]).astype(int)
+        rows.extend(int(start + lo + rng.integers(hi - lo)) for lo, hi in zip(low, high, strict=True))
+    return rows
 
 
 def describe_episode_split(split: dict[str, Any] | None) -> str:
@@ -325,15 +377,19 @@ def task_subset_asset_id(
     task_names: str | Iterable[str] | None,
     *,
     settle_steps: str = "all",
+    gripper_action: str = "absolute",
 ) -> str:
-    """Asset id (norm stats directory) for ``repo_id`` restricted to ``task_names`` and ``settle_steps``;
-    ``repo_id`` itself when ``task_names`` is empty and ``settle_steps == 'all'``."""
+    """Asset id (norm stats directory) for ``repo_id`` restricted to ``task_names`` and ``settle_steps``, under
+    ``gripper_action``; ``repo_id`` itself when ``task_names`` is empty, ``settle_steps == 'all'`` and the gripper
+    actions are absolute."""
     names = normalize_task_names(task_names)
     spec = parse_settle_steps(settle_steps)
-    base = repo_id if names is None else f"{repo_id}/{TASK_SUBSETS_DIR_NAME}/{task_subset_key(names)}"
-    if spec == "all":
-        return base
-    return f"{base}/{SETTLE_STEPS_DIR_NAME}/{spec}"
+    asset_id = repo_id if names is None else f"{repo_id}/{TASK_SUBSETS_DIR_NAME}/{task_subset_key(names)}"
+    if spec != "all":
+        asset_id = f"{asset_id}/{SETTLE_STEPS_DIR_NAME}/{spec}"
+    if gripper_action != "absolute":
+        asset_id = f"{asset_id}/{GRIPPER_ACTION_DIR_NAME}/{gripper_action}"
+    return asset_id
 
 
 @dataclasses.dataclass(frozen=True)

@@ -22,12 +22,15 @@ MODEL_FIELDS = (
 )
 
 
-def action_representation(robot_config: Any, *, extra_delta_transform: bool) -> dict[str, Any]:
+def action_representation(
+    robot_config: Any, *, extra_delta_transform: bool, gripper_action: str = "absolute"
+) -> dict[str, Any]:
     """Robot/action convention of a training or serving run, as recorded in ``b1k_metadata.json``.
 
     The layout matches the `my` branch (`b90f734`) so its tooling can identify these artifacts: this checkout's
     ``StateActionConfig`` has no explicit ``delta_state_indices`` (all delta groups are matched to proprio slices
     in order), which is recorded as ``None`` -- the convention `my` registers as ``b1k/R1Pro-legacy-torso-delta``.
+    ``gripper_action`` is recorded only when it is not ``absolute`` (the convention of every earlier artifact).
     """
 
     def group(config):
@@ -39,13 +42,16 @@ def action_representation(robot_config: Any, *, extra_delta_transform: bool) -> 
             "delta_state_indices": getattr(config, "delta_state_indices", None),
         }
 
-    return {
+    representation = {
         "robot_type": robot_config.robot_type,
         "action_dim": robot_config.action_dim,
         "extra_delta_transform": extra_delta_transform,
         "actions": [group(config) for config in robot_config.action],
         "proprio": [group(config) for config in robot_config.proprio],
     }
+    if gripper_action != "absolute":
+        representation["gripper_action"] = gripper_action
+    return representation
 
 
 def load_metadata(assets_dir: Any) -> dict[str, Any] | None:

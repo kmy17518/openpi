@@ -452,6 +452,14 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     goal_views: Sequence[str] = ()
     goal_source: _b1k_dataset.GoalSource | None = None
     conditioning_regime: Literal["none", "language", "image", "image_language"] | None = None
+    # Gripper action dims (the robot's end-effector groups, 14 and 22 on R1Pro): `absolute` commands (default), or
+    # `delta` commands relative to the gripper state, which is then fed in command units (20 * (q1 + q2) - 1). Recorded
+    # in the action representation and the norm-stats asset id (`.../gripper_action/delta`); needs
+    # extra_delta_transform. CLI: --data.gripper-action delta
+    gripper_action: b1k_policy.GripperAction = "absolute"
+    # Served gripper commands are clamped to [-1, 1] and set to +1 (open) above this threshold; None serves them
+    # unchanged. Applies to inference only (`B1KOutputs`).
+    gripper_snap_threshold: float | None = b1k_policy.DEFAULT_GRIPPER_SNAP_THRESHOLD
 
     @override
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -471,7 +479,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             asset_id = (
                 repo_id
                 if isinstance(repo_id, list)
-                else _b1k_dataset.task_subset_asset_id(repo_id, task_names, settle_steps=settle_steps)
+                else _b1k_dataset.task_subset_asset_id(
+                    repo_id, task_names, settle_steps=settle_steps, gripper_action=self.gripper_action
+                )
             )
         assets_dir = epath.Path(self.assets.assets_dir or assets_dirs)
         metadata_asset_id = next(iter(asset_id), None) if isinstance(asset_id, list) else asset_id
@@ -515,6 +525,17 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 )
             mappings.append((action_config.indices, state_slices[state_slice_index]))
             state_slice_index += 1
+        if self.gripper_action == "delta":
+            # The i-th end-effector action group is relative to the i-th end-effector state (the gripper state in
+            # command units, see B1KInputs).
+            gripper_actions = [list(config.indices) for config in robot_config.action if config.is_eef]
+            gripper_states = [state_slices[i] for i, config in enumerate(robot_config.proprio) if config.is_eef]
+            if len(gripper_actions) != len(gripper_states) or any(len(group) != 1 for group in gripper_actions):
+                raise ValueError(
+                    f"gripper_action=delta needs one single-dim end-effector action group per end-effector state "
+                    f"in robot config {robot_config.robot_type!r}"
+                )
+            mappings.extend(zip(gripper_actions, gripper_states, strict=True))
         return mappings
 
     @override
@@ -569,17 +590,36 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             {
                 "observation/state": "observation.state",
                 "actions": robot_config.action_key,
+                # padding mask of the action chunk (steps past the episode end), applied to the training loss
+                "action_is_pad": f"{robot_config.action_key}_is_pad",
                 "prompt": "prompt",
             }
         )
 
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_mapping)])
 
+        if self.gripper_action not in b1k_policy.GRIPPER_ACTIONS:
+            raise ValueError(f"gripper_action must be one of {b1k_policy.GRIPPER_ACTIONS}, got {self.gripper_action!r}")
+        if self.gripper_action == "delta" and not self.extra_delta_transform:
+            raise ValueError("gripper_action=delta needs extra_delta_transform")
         # Prepare data for policy training
         # Convert images to uint8 numpy arrays, add masks
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1KInputs(robot_config=robot_config, model_type=model_config.model_type, goal_views=goal_views)],
-            outputs=[b1k_policy.B1KOutputs(action_dim=robot_config.action_dim)],
+            inputs=[
+                b1k_policy.B1KInputs(
+                    robot_config=robot_config,
+                    model_type=model_config.model_type,
+                    goal_views=goal_views,
+                    gripper_action=self.gripper_action,
+                )
+            ],
+            outputs=[
+                b1k_policy.B1KOutputs(
+                    action_dim=robot_config.action_dim,
+                    gripper_snap_threshold=self.gripper_snap_threshold,
+                    gripper_dims=tuple(i for config in robot_config.action if config.is_eef for i in config.indices),
+                )
+            ],
         )
         if regime is not None:
             # The prompt scaffold is fixed and task-independent; task-dependent text only enters in the language regimes.
@@ -614,7 +654,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         return dataclasses.replace(
             base_config,
             action_representation=_b1k_artifacts.action_representation(
-                robot_config, extra_delta_transform=self.extra_delta_transform
+                robot_config, extra_delta_transform=self.extra_delta_transform, gripper_action=self.gripper_action
             ),
             allow_legacy_assets=self.allow_legacy_assets,
             goal_views=goal_views,
@@ -815,6 +855,10 @@ class TrainConfig:
     val_batch_size: int | None = None
     # Number of validation batches to average for validation loss
     val_num_batches: int = 10
+    # Validate on the `held_out` episodes of the training data's episode split (`--data.episode-split`; tasks without
+    # held-out episodes are skipped), with the training repo_id, dataset_root, task_names, settle_steps, goal settings
+    # and norm stats. Otherwise validation needs --val-repo-id. CLI: --val-held-out
+    val_held_out: bool = False
     # Optionally, repo_id for validation set (if different from train)
     val_repo_id: str | None = None
     val_episodes_index: List[int] | None = None

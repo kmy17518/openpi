@@ -131,7 +131,11 @@ class FakeDataset(Dataset):
 
 
 def create_b1k_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig | None = None
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig | None = None,
+    *,
+    subset: str = "train",
 ) -> Dataset:
     """Create a behavior dataset for training.
 
@@ -140,7 +144,7 @@ def create_b1k_dataset(
     loaded (resolved against `meta/tasks.parquet` / `meta/episodes/`, so a misspelled name or a partial download
     of other tasks fails here rather than mid-training). Prompts follow `data_config.prompt_source` (task name or
     natural-language description); when `model_config` is given, prompts that would not fit its `max_token_len`
-    are rejected up front.
+    are rejected up front. With an episode split, `subset` selects its `train` or `held_out` episodes.
     """
     if data_config.dataset_root is None:
         raise ValueError("dataset_root is not set. Pass --data.dataset-root=<local LeRobot root> for B1K datasets.")
@@ -159,12 +163,16 @@ def create_b1k_dataset(
         if data_config.task_names and expanded_tasks != list(data_config.task_names):
             logging.info("--data.task-names %s select the tasks %s", list(data_config.task_names), expanded_tasks)
         episode_split = _b1k_dataset.resolve_episode_split(
-            data_config.dataset_root, getattr(data_config, "episode_split", "auto"), expanded_tasks
+            data_config.dataset_root, getattr(data_config, "episode_split", "auto"), expanded_tasks, subset=subset
         )
         if episode_split is not None:
             logging.info("Episode split %s", _b1k_dataset.describe_episode_split(episode_split))
-            if expanded_tasks is None:
-                expanded_tasks = list(episode_split["tasks"])
+            # every task of the file without task names; held_out drops the tasks that have no held-out episode
+            expanded_tasks = list(episode_split["tasks"])
+        elif subset != "train":
+            raise ValueError(
+                f"The {subset} episodes need an episode split (--data.episode-split); {data_config.dataset_root} has none"
+            )
         task_names = _b1k_dataset.normalize_task_names(expanded_tasks)
         episodes = dataset_kwargs.get("episodes")
         if episode_split is not None:
@@ -451,7 +459,7 @@ def create_b1k_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[tuple[_model.Observation, _model.Actions, jax.Array]]:
     data_config = config.data.create(config.assets_dirs, config.model)
     dataset = create_b1k_dataset(
         data_config=data_config, action_horizon=config.model.action_horizon, model_config=config.model
@@ -469,7 +477,47 @@ def create_b1k_data_loader(
         seed=config.seed,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return B1KDataLoaderImpl(data_config, data_loader)
+
+
+def load_b1k_fixed_batches(
+    data_config: _config.DataConfig,
+    model_config: _model.BaseModelConfig,
+    *,
+    subset: str,
+    batch_size: int,
+    num_batches: int,
+    seed: int,
+    num_workers: int = 0,
+) -> tuple[list[dict], str]:
+    """Transformed batches of a fixed selection of frames of the `subset` episodes, loaded once.
+
+    `num_batches` batches of `batch_size` frames (fewer when the episodes hold fewer frames) spread over every
+    episode by `b1k_dataset.spread_frame_indices` with `seed`, so each call returns the same frames. Transforms and
+    norm stats are those of `data_config`. Returns the collated numpy batches and a description for logs.
+    """
+    dataset = create_b1k_dataset(data_config, model_config.action_horizon, model_config, subset=subset)
+    frames = getattr(dataset, "_dataset", dataset)
+    episode_index = frames.hf_dataset.data.column("episode_index").to_numpy()
+    rows = _b1k_dataset.spread_frame_indices(episode_index, batch_size * num_batches, seed)
+    rows = rows[: len(rows) // batch_size * batch_size]
+    if not rows:
+        raise ValueError(f"The {subset} episodes hold {len(episode_index)} frames, fewer than a batch of {batch_size}")
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(transform_dataset(dataset, data_config), rows),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=min(num_workers, len(rows) // batch_size),
+        multiprocessing_context=multiprocessing.get_context("spawn") if num_workers > 0 else None,
+        collate_fn=_collate_fn,
+        worker_init_fn=_worker_init_fn,
+    )
+    batches = list(loader)
+    description = (
+        f"{len(rows)} frames ({len(batches)} batches of {batch_size}, seed {seed}) of the {subset} episodes: "
+        f"{len(np.unique(episode_index))} episodes, {len(episode_index)} frames"
+    )
+    return batches, description
 
 
 def create_torch_data_loader(
@@ -754,3 +802,16 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+
+class B1KDataLoaderImpl(DataLoaderImpl):
+    """Yields `(observation, actions, action_is_pad)`; `action_is_pad` (bool `[B, H]`) marks the action-chunk steps
+    past the episode end, all False when the dataset has no mask."""
+
+    def __iter__(self):
+        for batch in self._data_loader:
+            actions = batch["actions"]
+            is_pad = batch.get("action_is_pad")
+            if is_pad is None:
+                is_pad = jnp.zeros(actions.shape[:2], bool, device=getattr(actions, "sharding", None))
+            yield _model.Observation.from_dict(batch), actions, is_pad

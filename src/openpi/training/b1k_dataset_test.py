@@ -5,6 +5,7 @@ The synthetic dataset mimics the challenge demos' layout -- one chunk per task, 
 real 3 TB dataset.
 """
 
+import collections
 import dataclasses
 import json
 import pathlib
@@ -26,14 +27,16 @@ FRAMES_PER_EPISODE = 12
 HORIZON = 5
 
 
-def _write_synthetic_root(root: pathlib.Path, chunks: list[int]) -> None:
+def _write_synthetic_root(
+    root: pathlib.Path, chunks: list[int], state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM
+) -> None:
     """Write ``meta/`` (dataset-wide) plus the data / episode-metadata files of ``chunks`` only."""
     meta = root / "meta"
     (meta / "episodes").mkdir(parents=True)
     (root / "data").mkdir()
     features = {
-        "observation.state": {"dtype": "float32", "shape": [STATE_DIM], "names": None},
-        "action": {"dtype": "float32", "shape": [ACTION_DIM], "names": None},
+        "observation.state": {"dtype": "float32", "shape": [state_dim], "names": None},
+        "action": {"dtype": "float32", "shape": [action_dim], "names": None},
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},
         "frame_index": {"dtype": "int64", "shape": [1], "names": None},
         "episode_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -82,8 +85,8 @@ def _write_synthetic_root(root: pathlib.Path, chunks: list[int]) -> None:
                 index = start + frame
                 frames.append(
                     {
-                        "observation.state": np.full(STATE_DIM, index, dtype=np.float32),
-                        "action": np.full(ACTION_DIM, index, dtype=np.float32),
+                        "observation.state": np.full(state_dim, index, dtype=np.float32),
+                        "action": np.full(action_dim, index, dtype=np.float32),
                         "timestamp": np.float32(frame / FPS),
                         "frame_index": frame,
                         "episode_index": episode_index,
@@ -578,10 +581,15 @@ def _write_task_groups(root: pathlib.Path, groups: dict, fmt: str = "isg-task-gr
     return path
 
 
-def _write_episode_split(root: pathlib.Path, train_episodes: dict[str, list[int]], fmt: str = "isg-episode-split/v1") -> pathlib.Path:
+def _write_episode_split(
+    root: pathlib.Path,
+    train_episodes: dict[str, list[int]],
+    fmt: str = "isg-episode-split/v1",
+    held_out: dict[str, list[int]] | None = None,
+) -> pathlib.Path:
     path = root / "isg_meta/train_split.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    tasks = {task: {"train": train, "held_out": []} for task, train in train_episodes.items()}
+    tasks = {task: {"train": train, "held_out": (held_out or {}).get(task, [])} for task, train in train_episodes.items()}
     path.write_text(json.dumps({"format": fmt, "name": "tiny", "tasks": tasks}))
     return path
 
@@ -666,6 +674,102 @@ def test_episode_split_resolution_and_dataset_filtering(full_root: pathlib.Path,
 
     with pytest.raises(FileNotFoundError, match="missing.json"):
         b1k_dataset.resolve_episode_split(full_root, str(tmp_path / "missing.json"))
+
+
+def test_held_out_episodes_skip_tasks_without_any(full_root: pathlib.Path, caplog):
+    from openpi.training import config
+    from openpi.training import data_loader
+
+    _write_episode_split(
+        full_root,
+        {"turning_on_radio": [0], "picking_up_trash": [2, 3], "chop_an_onion": [4]},
+        held_out={"turning_on_radio": [1], "chop_an_onion": [5]},
+    )
+    split = b1k_dataset.resolve_episode_split(full_root, "auto", subset="held_out")
+    assert split["subset"] == "held_out" and split["episodes"] == [1, 5]
+    assert split["tasks"] == ["turning_on_radio", "chop_an_onion"]
+    assert "['picking_up_trash'] have no held-out episodes" in caplog.text
+    assert b1k_dataset.resolve_episode_split(full_root, "auto")["episodes"] == [0, 2, 3, 4]
+    with pytest.raises(ValueError, match="None of the selected tasks has held-out episodes"):
+        b1k_dataset.resolve_episode_split(full_root, "auto", ["picking_up_trash"], subset="held_out")
+    with pytest.raises(ValueError, match="subset must be one of"):
+        b1k_dataset.resolve_episode_split(full_root, "auto", subset="test")
+
+    dc = config.DataConfig(
+        repo_id="org/demos",
+        dataset_root=str(full_root),
+        task_names=["turning_on_radio", "picking_up_trash", "chop_an_onion"],
+        episode_split="auto",
+        action_sequence_keys=("action",),
+    )
+    held_out = data_loader.create_b1k_dataset(dc, HORIZON, subset="held_out")
+    assert held_out.episodes == [1, 5] and len(held_out) == 2 * FRAMES_PER_EPISODE
+    assert data_loader.create_b1k_dataset(dc, HORIZON).episodes == [0, 2, 3, 4]
+    with pytest.raises(ValueError, match="need an episode split"):
+        data_loader.create_b1k_dataset(dataclasses.replace(dc, episode_split="none"), HORIZON, subset="held_out")
+
+
+def test_spread_frame_indices_cover_every_episode_and_repeat_with_the_seed():
+    episode_index = np.repeat([7, 3, 9, 4], [12, 12, 3, 30])
+    rows = b1k_dataset.spread_frame_indices(episode_index, 10, seed=0)
+    assert len(set(rows)) == 10 and rows == sorted(rows)
+    # shares of 10 proportional to 12:12:3:30 frames, at least one per episode
+    assert collections.Counter(episode_index[rows].tolist()) == {7: 2, 3: 2, 9: 1, 4: 5}
+    assert rows == b1k_dataset.spread_frame_indices(episode_index, 10, seed=0)
+    assert rows != b1k_dataset.spread_frame_indices(episode_index, 10, seed=1)
+    long_episode = [row - 27 for row in rows if episode_index[row] == 4]
+    assert [position // 6 for position in long_episode] == [0, 1, 2, 3, 4]  # one per stretch of 6 frames
+    assert set(episode_index[b1k_dataset.spread_frame_indices(episode_index, 2, seed=0)].tolist()) == {7, 4}
+    assert b1k_dataset.spread_frame_indices(episode_index, 57, seed=0) == list(range(57))
+    with pytest.raises(ValueError, match="contiguous"):
+        b1k_dataset.spread_frame_indices([0, 1, 0], 2, seed=0)
+
+
+def test_action_is_pad_reaches_the_training_batch_and_flags_the_program_end(tmp_path: pathlib.Path, monkeypatch):
+    from lerobot.datasets import dataset_reader
+    from openpi.training import config
+    from openpi.training import data_loader
+
+    root = tmp_path / "r1pro"
+    _write_synthetic_root(root, chunks=[0], state_dim=61, action_dim=23)
+    cameras = [
+        "observation.rgb.zed_link_camera_0",
+        "observation.rgb.left_realsense_link_camera_0",
+        "observation.rgb.right_realsense_link_camera_0",
+    ]
+    _add_video_streams(root, dict.fromkeys(cameras, False))
+    monkeypatch.setattr(dataset_reader.DepthEncoderConfig, "from_video_info", mock.Mock())
+    for camera in cameras:
+        path = root / "videos" / camera / "chunk-000" / "file-000.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    monkeypatch.setattr(
+        b1k_dataset.VideoFrameReader, "read", lambda self, path, ts, tol: np.zeros((len(ts), 64, 64, 3), np.uint8)
+    )
+    programs = {0: 5, 1: 4}  # of 12 recorded frames each
+    _write_settle_windows(root, programs)
+    model = config.get_config("pi05_b1k").model
+    dc = config.LeRobotB1KDataConfig(
+        repo_id="org/demos",
+        dataset_root=str(root),
+        robot_config_name="b1k/R1Pro",
+        settle_steps="0",
+        base_config=config.DataConfig(prompt_from_task=True),
+    ).create(root / "assets", model)
+    dataset = data_loader.create_b1k_dataset(dc, HORIZON, model)
+    assert len(dataset) == sum(programs.values())
+    loader = data_loader.B1KDataLoaderImpl(
+        dc,
+        data_loader.TorchDataLoader(
+            data_loader.transform_dataset(dataset, dc, skip_norm_stats=True), local_batch_size=len(dataset), num_batches=1
+        ),
+    )
+    observation, actions, action_is_pad = next(iter(loader))
+    # padded from the program end (not the recorded end): frame f of a program of n frames pads steps t >= n - f
+    expected = [[frame + t >= n for t in range(HORIZON)] for n in programs.values() for frame in range(n)]
+    assert np.asarray(action_is_pad).tolist() == expected
+    assert actions.shape == (len(dataset), HORIZON, model.action_dim)
+    assert observation.state.shape[0] == len(dataset)
 
 
 def test_settle_steps_parse_and_cut_episodes(full_root: pathlib.Path):
