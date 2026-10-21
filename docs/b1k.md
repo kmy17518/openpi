@@ -330,6 +330,21 @@ New checkpoints save `b1k_metadata.json` next to their norm stats (`assets/<asse
 
 This checkout predicts all four R1Pro torso joints as deltas (the convention of the original challenge fork). The `my` branch later switched trunk joint 4 to an absolute target and registers the convention used here as `b1k/R1Pro-legacy-torso-delta`: the metadata written here is byte-for-byte what `my` expects for that robot, so `my`'s serving can consume checkpoints trained with this checkout with `--robot b1k/R1Pro-legacy-torso-delta`, and rejects them for its current `b1k/R1Pro` (verified against `my`'s `b1k_artifacts`).
 
+#### Publishing checkpoints to Hugging Face
+
+`scripts/b1k/export_checkpoints.py` feeds the ACT repo's checkpoint uploader (`scripts/b1k/upload_checkpoints.py`, see its `b1k.md`), which publishes to a dedicated Hub repo every evaluation checkpoint as `eval/step-XXXXXXXX.tar` (`<STEP>/params` and `<STEP>/assets`, what `serve_b1k.py` loads) and exactly one resumable checkpoint as `resume/step-XXXXXXXX.tar` (all of `<STEP>/`). The exporter is a separate CPU-only process that only reads the checkpoint directory: as soon as orbax renames `<STEP>.orbax-checkpoint-tmp*` to `<STEP>`, long before `--max_to_keep` retention deletes it, it streams both uncompressed tars into `<RUN_DIR>/export_queue/{eval,full}/step_XXXXXXXX.tar` through fsynced temporary files. Only the newest full tar stays queued; `<RUN_DIR>/export_state.json` lists the exported steps, so tars the uploader has consumed are not written again; a tar is written only while its filesystem keeps room for one more checkpoint. The last checkpoint of a run is `num_train_steps - 1`, off the save grid: give it to both processes as `--max-steps`, and `--eval-every` = `--save_interval`.
+
+```bash
+python scripts/b1k/export_checkpoints.py --checkpoint-dir outputs/checkpoints/pi05_b1k/<EXP_NAME> \
+    --run-dir /tmp/dev/runs/<EXP_NAME> --max-steps 99999          # --num_train_steps 100000 --save_interval 5000
+# from the ACT checkout, with HF_TOKEN set; the staging directory must be on the run directory's filesystem
+.venv/bin/python scripts/b1k/upload_checkpoints.py --run-dir /tmp/dev/runs/<EXP_NAME> \
+    --staging-dir /tmp/dev/hf-staging/<EXP_NAME> --repo-id <HF_USER>/<EXP_NAME> --run-id <EXP_NAME> --public \
+    --max-steps 99999 --eval-every 5000 --metadata policy=pi05 --metadata config=pi05_b1k
+```
+
+A pi05_b1k step holds 3.35 B float32 parameters three times in `train_state/` (params and the two AdamW moments) and once in `params/` (the EMA params): 53.7 GB uncompressed, which only orbax's zstd compression brings to the 44.7 GB measured on disk for a 30,000-step pi05_b1k step, so the full tar stays 5 GB under the Hub's 50 GB file limit; the eval tar is 12.4 GB. To resume from `resume/step-XXXXXXXX.tar`, extract it into `outputs/checkpoints/pi05_b1k/<EXP_NAME>/` and write the W&B run id to `wandb_id.txt` there (or train with `--no-wandb-enabled`).
+
 #### SLURM cluster
 
 For cluster jobs, adapt `scripts/b1k/train_b1k.sbatch.sh` with your account, partition, and environment paths.
