@@ -830,6 +830,8 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Number of most recent checkpoints to keep (None keeps all), in addition to those kept by keep_period.
+    max_to_keep: int | None = 1
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False

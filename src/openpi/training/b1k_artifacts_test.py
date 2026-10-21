@@ -114,7 +114,7 @@ def test_real_orbax_asset_save_and_resume_validation(tmp_path, monkeypatch):
     monkeypatch.setattr(checkpoints, "_split_params", lambda state: ({"step": np.asarray(1)}, {"kernel": np.ones(2)}))
     monkeypatch.setattr(checkpoints, "_merge_params", lambda state, params: (state, params))
     manager, _ = checkpoints.initialize_checkpoint_dir(
-        tmp_path / "orbax", keep_period=None, overwrite=False, resume=False
+        tmp_path / "orbax", keep_period=None, max_to_keep=1, overwrite=False, resume=False
     )
     try:
         checkpoints.save_state(manager, object(), loader, 1)

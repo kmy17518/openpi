@@ -8,6 +8,7 @@
 # Everything is overridable through environment variables (defaults in brackets):
 #   EXP_NAME       experiment / checkpoint name          [turning-on-radio-<n>gpu-bs${BATCH_SIZE}-clean-<today>]
 #   BATCH_SIZE     global [512]  NUM_WORKERS [16]         NUM_TRAIN_STEPS [300000]   MAX_TOKEN_LEN [200]
+#   SAVE_INTERVAL  checkpoint every N steps [2500]        MAX_TO_KEEP  most recent checkpoints kept [1]
 #   GPU            CUDA_VISIBLE_DEVICES [0,1,2,3]         CPUS  taskset core list     [0-143]
 #   TASK_NAMES     [turning_on_radio]                     PROMPT_SOURCE               [task_name]
 #   SETTLE_STEPS   (optional, e.g. 0 or 0.1)              EPISODE_SPLIT (optional: auto | none | PATH)
@@ -50,6 +51,8 @@ BATCH_SIZE=${BATCH_SIZE:-512}
 NUM_WORKERS=${NUM_WORKERS:-16}
 NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS:-300000}
 MAX_TOKEN_LEN=${MAX_TOKEN_LEN:-200}
+SAVE_INTERVAL=${SAVE_INTERVAL:-2500}
+MAX_TO_KEEP=${MAX_TO_KEEP:-1}
 GPU=${GPU:-0,1,2,3}
 CPUS=${CPUS:-0-143}
 NGPU=$(( $(tr -cd ',' <<< "$GPU" | wc -c) + 1 ))
@@ -112,7 +115,8 @@ taskset -c "$CPUS" "$PYTHON" -u scripts/b1k/train_b1k.py pi05_b1k \
     --batch_size="$BATCH_SIZE" \
     --num_workers="$NUM_WORKERS" \
     --num_train_steps="$NUM_TRAIN_STEPS" \
-    --save_interval=2500 \
+    --save_interval="$SAVE_INTERVAL" \
+    --max_to_keep="$MAX_TO_KEEP" \
     --keep_period None \
     --log_interval=10 \
     --model.max-token-len "$MAX_TOKEN_LEN" \
