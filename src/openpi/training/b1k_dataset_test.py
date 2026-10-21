@@ -789,9 +789,10 @@ def test_val_split_matches_act(seed: int, fraction: float):
         b1k_dataset.split_val_episodes(episodes, 1.0, seed)
 
 
-def test_val_fraction_splits_training_and_validation_episodes(full_root: pathlib.Path):
+def test_val_fraction_splits_training_and_validation_episodes(full_root: pathlib.Path, monkeypatch):
     from openpi.training import config
     from openpi.training import data_loader
+    from scripts import compute_norm_stats
 
     tasks = ["turning_on_radio", "picking_up_trash", "chop_an_onion"]
     dc = config.DataConfig(
@@ -811,6 +812,10 @@ def test_val_fraction_splits_training_and_validation_episodes(full_root: pathlib
     assert split["tasks"]["picking_up_trash"] == expected["picking_up_trash"]
     assert data_loader.create_b1k_dataset(dc, HORIZON).episodes == split["train_episodes"]
     assert data_loader.create_b1k_dataset(dc, HORIZON, subset="val").episodes == split["val_episodes"]
+    reader = mock.Mock()
+    monkeypatch.setattr(compute_norm_stats._lerobot_lowdim, "LowDimLeRobotDataset", reader)  # noqa: SLF001
+    compute_norm_stats._create_lowdim_dataset(dc, HORIZON)  # noqa: SLF001
+    assert reader.call_args.kwargs["episodes"] == split["train_episodes"]
     assert b1k_dataset.resolve_val_split(meta, tasks, 0.0, 3) is None
     with pytest.raises(ValueError, match="need --data.val-fraction"):
         data_loader.create_b1k_dataset(dataclasses.replace(dc, val_fraction=0.0), HORIZON, subset="val")
