@@ -26,6 +26,28 @@ R1Pro = RobotConfig(
             resolution=[240, 240]
         ),
     },
+    # Goal-image views (goal-image conditioning): the goal frame of a camera. The radio skill-segment datasets ship
+    # them as static per-episode clips under observation.goal_rgb.*; requests carry them under goal::<camera key>.
+    goals={
+        "goal_image_0": ObservationConfig(
+            name="goal_head",
+            obs_key="goal::robot_r1::robot_r1:zed_link:Camera:0::rgb",
+            dataset_key="observation.goal_rgb.zed_link_camera_0",
+            resolution=[240, 240]
+        ),
+        "goal_image_1": ObservationConfig(
+            name="goal_left_wrist",
+            obs_key="goal::robot_r1::robot_r1:left_realsense_link:Camera:0::rgb",
+            dataset_key="observation.goal_rgb.left_realsense_link_camera_0",
+            resolution=[240, 240]
+        ),
+        "goal_image_2": ObservationConfig(
+            name="goal_right_wrist",
+            obs_key="goal::robot_r1::robot_r1:right_realsense_link:Camera:0::rgb",
+            dataset_key="observation.goal_rgb.right_realsense_link_camera_0",
+            resolution=[240, 240]
+        ),
+    },
     action_key="action",
     action_dim=23,
     action=[

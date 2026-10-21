@@ -99,6 +99,17 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # Goal-image conditioning: extra image slots (encoded by the same SigLIP encoder, fixed order after the
+        # cameras) and the optional learned goal-role vector added to their tokens (zero-initialised so the first
+        # experiment isolates adding the image input; saved/restored with the model state like any parameter).
+        self.goal_image_keys = tuple(config.goal_image_keys)
+        self.image_keys = (*_model.IMAGE_KEYS, *self.goal_image_keys)
+        self.goal_role_embed = (
+            nnx.Param(jnp.zeros((1, 1, paligemma_config.width), dtype=jnp.float32))
+            if config.goal_role_embedding
+            else None
+        )
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -109,9 +120,15 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        # embed images
-        for name in obs.images:
+        # embed images in the fixed configured order (camera slots, then goal slots) rather than the dict's iteration
+        # order: JAX tree utilities sort dict keys, which would move "goal_0_rgb" ahead of the wrist cameras.
+        if set(obs.images) != set(self.image_keys):
+            raise ValueError(f"Observation images {sorted(obs.images)} must be exactly {sorted(self.image_keys)}")
+        for name in self.image_keys:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            if self.goal_role_embed is not None and name in self.goal_image_keys:
+                # goal-role identity on every token of a goal image (PI-ROLE)
+                image_tokens = image_tokens + self.goal_role_embed.value.astype(image_tokens.dtype)
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -190,7 +207,9 @@ class Pi0(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        # Goal slots share the camera images' preprocessing; augmax draws every image's crop/rotation/jitter from
+        # the same per-sample key, so a goal and its camera receive matched geometric (and photometric) transforms.
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -222,7 +241,7 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(None, observation, train=False)
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self.image_keys)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps

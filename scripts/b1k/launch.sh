@@ -10,6 +10,9 @@
 #   BATCH_SIZE     global [512]  NUM_WORKERS [16]         NUM_TRAIN_STEPS [300000]   MAX_TOKEN_LEN [200]
 #   GPU            CUDA_VISIBLE_DEVICES [0,1,2,3]         CPUS  taskset core list     [0-143]
 #   TASK_NAMES     [turning_on_radio]                     PROMPT_SOURCE               [task_name]
+#   SETTLE_STEPS   (optional, e.g. 0 or 0.1)              EPISODE_SPLIT (optional: auto | none | PATH)
+#   PI_CONDITION   (optional: none | language | image | image_language; PI_ROLE=0|1, PI_GOAL_VIEWS=goal_image_0,
+#                  PI_GOAL_SOURCE=episode_last|goal_key)
 #   REPO_ID        [behavior-1k/2026-challenge-demos]     DATASET_ROOT [/tmp/dev/datasets/2026-challenge-demos]
 #   WANDB_PROJECT  [b1k-challenge-2026-pi]                WANDB_RUN_ID (optional; W&B generates one if unset)
 #   WANDB_ENTITY   [kmy17518]                             WANDB_MODE   [online]
@@ -82,6 +85,25 @@ export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=false"
 
 cd "$OPENPI_DIR" || exit 1
 PYTHON=${PYTHON:-.venv-jax/bin/python}
+extra_flags=()
+if [ -n "${SETTLE_STEPS:-}" ]; then extra_flags+=(--data.settle-steps "$SETTLE_STEPS"); fi
+if [ -n "${EPISODE_SPLIT:-}" ]; then extra_flags+=(--data.episode-split "$EPISODE_SPLIT"); fi
+if [ -n "${PI_CONDITION:-}" ]; then
+    GOAL_VIEWS=${PI_GOAL_VIEWS:-goal_image_0}
+    ROLE=${PI_ROLE:-0}
+    slots=()
+    i=0
+    for _ in ${GOAL_VIEWS//,/ }; do slots+=("goal_${i}_rgb"); i=$((i + 1)); done
+    case "$PI_CONDITION" in
+        none|language) extra_flags+=(--data.conditioning-regime "$PI_CONDITION") ;;
+        image|image_language)
+            extra_flags+=(--data.conditioning-regime "$PI_CONDITION" --data.goal-views ${GOAL_VIEWS//,/ }
+                          --model.goal-image-keys "${slots[@]}")
+            if [ -n "${PI_GOAL_SOURCE:-}" ]; then extra_flags+=(--data.goal-source "$PI_GOAL_SOURCE"); fi
+            if [[ "$ROLE" == 1 ]]; then extra_flags+=(--model.goal-role-embedding); fi ;;
+        *) printf 'Unknown PI_CONDITION %s\n' "$PI_CONDITION" >&2; exit 2 ;;
+    esac
+fi
 echo "[$(date '+%F %T')] launching $EXP_NAME (global batch $BATCH_SIZE on $NGPU GPU(s) [$GPU], $NUM_WORKERS workers, CPUs $CPUS, W&B run id ${WANDB_RUN_ID:-<auto>}, python $PYTHON) from $OPENPI_DIR @ $(git rev-parse --short HEAD)" | tee -a "$LOG"
 # shellcheck disable=SC2086
 taskset -c "$CPUS" "$PYTHON" -u scripts/b1k/train_b1k.py pi05_b1k \
@@ -98,6 +120,7 @@ taskset -c "$CPUS" "$PYTHON" -u scripts/b1k/train_b1k.py pi05_b1k \
     --data.dataset-root="$DATASET_ROOT" \
     --data.task-names ${TASK_NAMES//,/ } \
     --data.prompt-source "$PROMPT_SOURCE" \
+    "${extra_flags[@]}" \
     "$@" 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 echo "[$(date '+%F %T')] trainer exited with code $rc" | tee -a "$LOG"

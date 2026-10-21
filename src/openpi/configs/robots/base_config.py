@@ -1,6 +1,6 @@
 """Base configuration dataclasses for robot configs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
@@ -53,6 +53,10 @@ class RobotConfig:
     action_dim: int
     action: List[StateActionConfig]
     proprio: List[StateActionConfig]
+    # Goal-image views (goal-image conditioning): one ObservationConfig per goal view, keyed like the cameras
+    # ("goal_image_0", ...). `obs_key` is the wire key of the goal image in inference requests, `dataset_key` the
+    # LeRobot video key holding the goal stream. Selected per run through the data config (`goal_views`).
+    goals: Dict[str, ObservationConfig] = field(default_factory=dict)
     
     def __post_init__(self):
         """Convert dictionaries to proper dataclass instances if needed."""
@@ -61,6 +65,11 @@ class RobotConfig:
             self.observations = {
                 key: ObservationConfig(**val) if isinstance(val, dict) else val
                 for key, val in self.observations.items()
+            }
+        if self.goals:
+            self.goals = {
+                key: ObservationConfig(**val) if isinstance(val, dict) else val
+                for key, val in self.goals.items()
             }
         
         # Convert action and proprio configs if they're still dicts

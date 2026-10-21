@@ -34,11 +34,29 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # Goal-image conditioning (JAX model; see docs/b1k.md "Goal-image conditioning"):
+    # - goal_image_keys ("PI-SLOT"): extra image slots, a prefix of _model.GOAL_IMAGE_KEYS in that fixed order, encoded
+    #   by the existing SigLIP encoder and appended to the visual prefix after the three camera images. The data
+    #   config's `goal_views` must supply exactly these keys.
+    # - goal_role_embedding ("PI-ROLE"): a learned vector (zero-initialised, VLM width) added to every token of every
+    #   goal image after the image projection, so goal slots are distinguishable from camera slots. Our extension,
+    #   not a verified component of ForeAct or VISTA.
+    goal_image_keys: tuple[str, ...] = ()
+    goal_role_embedding: bool = False
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        goal_keys = tuple(self.goal_image_keys)
+        object.__setattr__(self, "goal_image_keys", goal_keys)
+        if goal_keys != _model.GOAL_IMAGE_KEYS[: len(goal_keys)]:
+            raise ValueError(
+                f"goal_image_keys must be a prefix of {_model.GOAL_IMAGE_KEYS} in that order, got {goal_keys}"
+            )
+        if self.goal_role_embedding and not goal_keys:
+            raise ValueError("goal_role_embedding requires at least one goal image key")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -65,18 +83,11 @@ class Pi0Config(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        image_keys = (*_model.IMAGE_KEYS, *self.goal_image_keys)
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images={key: image_spec for key in image_keys},
+                image_masks={key: image_mask_spec for key in image_keys},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),

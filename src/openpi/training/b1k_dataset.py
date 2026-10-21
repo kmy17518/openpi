@@ -23,9 +23,12 @@ selected episodes (a one-task subset of the full root opens 6 parquet files inst
 import collections
 from collections.abc import Iterable, Sequence
 import dataclasses
+from decimal import Decimal
+from fractions import Fraction
 import hashlib
 import json
 import logging
+import math
 import pathlib
 import re
 from typing import Any, Literal, get_args
@@ -39,7 +42,9 @@ from lerobot.datasets.io_utils import hf_transform_to_torch
 from lerobot.utils.import_utils import get_safe_default_video_backend
 from lerobot.utils.utils import SuppressProgressBars
 import numpy as np
+import pyarrow as pa
 import pyarrow.dataset as pa_ds
+import pyarrow.parquet as pq
 import torch
 
 from openpi.configs.tasks import TASK_REGISTRY
@@ -58,22 +63,247 @@ TASKS_JSONL_FILENAME = "tasks.jsonl"
 PROMPT_SOURCE_FILENAME = "prompt_source.json"
 TASK_REGISTRY_BUCKET = "b1k"
 
+# Goal images (goal-image conditioning): one image per selected camera view, no observation-history axis.
+#   episode_last -- the last recorded frame of the episode's own camera stream (the settled terminal state, also
+#                   when --data.settle-steps cuts the episode earlier; works on any LeRobot v3 root, including the
+#                   challenge demos and ISG);
+#   goal_key     -- a dedicated goal video stream shipped by the dataset (`observation.goal_rgb.<camera>_camera_0`,
+#                   static per episode, as in the radio skill-segment datasets).
+GoalSource = Literal["episode_last", "goal_key"]
+GOAL_SOURCES: tuple[str, ...] = get_args(GoalSource)
+DEFAULT_GOAL_SOURCE: GoalSource = "episode_last"
+
+EPISODE_SPLIT_FILE = "isg_meta/train_split.json"
+EPISODE_SPLIT_FORMAT = "isg-episode-split/v1"
+TASK_GROUPS_FILE = "isg_meta/task_groups.json"
+TASK_GROUPS_FORMAT = "isg-task-groups/v1"
+SETTLE_WINDOWS_FILE = "isg_meta/settle_windows.json"
+SETTLE_WINDOWS_FORMAT = "isg-settle-windows/v1"
+
 # Norm stats of a task subset live under ``<repo_id>/task_subsets/<key>/`` (mirrors the GR00T baseline's
 # ``meta/task_subsets/<key>/``), so per-task statistics never shadow the dataset-wide ones and different
 # subsets of the same dataset do not clobber each other.
 TASK_SUBSETS_DIR_NAME = "task_subsets"
+SETTLE_STEPS_DIR_NAME = "settle_steps"
 _TASK_SUBSET_KEY_SEPARATOR = "+"
 _TASK_SUBSET_KEY_SAFE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
 _TASK_SUBSET_KEY_MAX_LEN = 96
 
 
-def normalize_task_names(task_names: str | Iterable[str] | None) -> tuple[str, ...] | None:
-    """Canonical ``task_names`` value: sorted unique tuple, or ``None`` for "all tasks"."""
+def expand_task_groups(
+    dataset_path: str | pathlib.Path | None, task_names: str | Iterable[str] | None
+) -> list[str] | None:
+    """``task_names`` with every task group of ``<root>/isg_meta/task_groups.json`` replaced by the tasks it reaches.
+
+    A group lists task names and/or other groups. ``None`` (every task) stays ``None``, and without a group file
+    the names are returned unchanged; otherwise the tasks come back without duplicates in order of first appearance.
+    """
+    if task_names is None:
+        return None
+    names = [str(task_names)] if isinstance(task_names, str) else [str(name) for name in task_names]
+    if dataset_path is None:
+        return names
+    path = pathlib.Path(dataset_path) / TASK_GROUPS_FILE
+    if not path.is_file():
+        return names
+    content = json.loads(path.read_text())
+    groups = content.get("groups")
+    if content.get("format") != TASK_GROUPS_FORMAT or not isinstance(groups, dict):
+        raise ValueError(f"{path} is not an {TASK_GROUPS_FORMAT} task group file (format {content.get('format')!r})")
+    tasks = {
+        row.get("task", row.get("__index_level_0__"))
+        for row in pq.read_table(pathlib.Path(dataset_path) / "meta/tasks.parquet").to_pylist()
+    }
+
+    def expand(name: str, parents: tuple[str, ...]) -> list[str]:
+        if name in tasks:
+            if name in groups:
+                raise ValueError(f"{name!r} is both a task and a task group in {path}")
+            return [name]
+        if name not in groups:
+            if parents:
+                raise ValueError(f"Task group {parents[-1]!r} in {path} lists unknown task or group {name!r}")
+            raise ValueError(
+                f"Unknown task or task group {name!r}; groups in {path}: {sorted(groups)}; tasks: {sorted(tasks)}"
+            )
+        if name in parents:
+            raise ValueError(f"Task group cycle {' -> '.join([*parents, name])} in {path}")
+        members = groups[name]
+        if not isinstance(members, list) or not members or not all(isinstance(member, str) for member in members):
+            raise ValueError(f"Task group {name!r} in {path} must be a nonempty list of task or group names")
+        return [task for member in members for task in expand(member, (*parents, name))]
+
+    return list(dict.fromkeys(task for name in names for task in expand(name, ())))
+
+
+def resolve_episode_split(
+    dataset_path: str | pathlib.Path | None,
+    spec: str = "auto",
+    task_names: str | Iterable[str] | None = None,
+) -> dict[str, Any] | None:
+    """Training episodes of ``--data.episode-split SPEC`` as a JSON-serializable record, or None without a split.
+
+    ``auto`` reads ``<root>/isg_meta/train_split.json`` when that file exists (no split otherwise), ``none``
+    disables the split, any other value is the path of a split file. The selected tasks are ``task_names``
+    (expanded through ``isg_meta/task_groups.json`` when present) or, when omitted, every task of the file;
+    the episodes are the sorted union of their ``train`` lists.
+    """
+    if spec == "none" or dataset_path is None:
+        if spec not in ("auto", "none") and dataset_path is None:
+            path = pathlib.Path(spec)
+        else:
+            return None
+    else:
+        path = pathlib.Path(dataset_path) / EPISODE_SPLIT_FILE if spec == "auto" else pathlib.Path(spec)
+    if not path.is_file():
+        if spec == "auto":
+            return None
+        raise FileNotFoundError(f"Episode split file {path} not found")
+    path = path.resolve()
+    content = path.read_bytes()
+    split = json.loads(content)
+    if split.get("format") != EPISODE_SPLIT_FORMAT or not isinstance(split.get("tasks"), dict):
+        raise ValueError(f"{path} is not an {EPISODE_SPLIT_FORMAT} episode split (format {split.get('format')!r})")
+    expanded = expand_task_groups(dataset_path, task_names) if task_names is not None else None
+    tasks = list(dict.fromkeys(expanded or split["tasks"]))
+    missing = [name for name in tasks if name not in split["tasks"]]
+    if missing:
+        raise ValueError(f"Selected tasks {missing} have no entry in episode split {path}")
+    episodes = sorted({int(episode) for name in tasks for episode in split["tasks"][name]["train"]})
+    return {
+        "file": str(path),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "format": split["format"],
+        "name": split.get("name"),
+        "subset": "train",
+        "tasks": tasks,
+        "episodes": episodes,
+    }
+
+
+def describe_episode_split(split: dict[str, Any] | None) -> str:
+    """One line for logs and errors: name, file, number of episodes and tasks of a split record."""
+    if split is None:
+        return "no episode split"
+    return (
+        f"{split['name']} ({split['file']}, sha256 {split['sha256'][:12]}): {len(split['episodes'])} "
+        f"{split['subset']} episodes of tasks {split['tasks']}"
+    )
+
+
+def parse_settle_steps(spec: str | int | float) -> str:
+    """Canonical ``--data.settle-steps`` SPEC: ``all``, a number of settle frames (``'0'``, ``'10'``) or a decimal
+    fraction of each episode's program length (``'0.2'``; ``'1.0'`` is the whole program length, ``'1'`` one frame).
+    Raises ``ValueError`` otherwise.
+    """
+    text = str(spec).strip()
+    if text == "all":
+        return text
+    if re.fullmatch(r"[0-9]+", text):
+        return str(int(text))
+    if re.fullmatch(r"[0-9]*\.[0-9]+|[0-9]+\.", text):
+        value = format(Decimal(text).normalize(), "f")
+        return value if "." in value else f"{value}.0"
+    raise ValueError(
+        "--settle-steps must be all, a number of frames (0, 10) or a decimal fraction of the program "
+        f"length (0.1, 0.2); got {spec!r}"
+    )
+
+
+def settle_frames(spec: str, program_length: int) -> int:
+    """Settle frames that a canonical SPEC other than ``all`` requests after ``program_length`` program frames."""
+    return math.ceil(Fraction(spec) * program_length) if "." in spec else int(spec)
+
+
+def apply_settle_steps(
+    dataset_path: str | pathlib.Path,
+    spec: str | int | float,
+    episodes: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Cut episodes (``meta/episodes`` rows; ``length`` and ``dataset_to_index`` change in place) to ``--settle-steps SPEC``.
+
+    ``all`` keeps every recorded frame and returns ``None``. Otherwise each episode keeps its program -- the first
+    ``program_length`` frames listed by ``<root>/isg_meta/settle_windows.json`` -- followed by SPEC settle frames,
+    capped at the recorded window; returns the record saved with runs and checkpoints.
+    """
+    spec = parse_settle_steps(spec)
+    if spec == "all":
+        return None
+    path = pathlib.Path(dataset_path).resolve() / SETTLE_WINDOWS_FILE
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"--settle-steps {spec} needs {path}, the program length of every episode; only datasets "
+            "whose episodes end with a recorded settle window ship it"
+        )
+    content = path.read_bytes()
+    windows = json.loads(content)
+    if windows.get("format") != SETTLE_WINDOWS_FORMAT or not isinstance(windows.get("episodes"), dict):
+        raise ValueError(f"{path} is not an {SETTLE_WINDOWS_FORMAT} file (format {windows.get('format')!r})")
+    recorded = settle = capped = 0
+    for ep in episodes:
+        entry = windows["episodes"].get(str(ep["episode_index"]))
+        if not entry or entry.get("length") != ep["length"] or not 0 < entry.get("program_length", 0) <= ep["length"]:
+            raise ValueError(
+                f"{path} has no settle window for episode {ep['episode_index']} of length {ep['length']} "
+                f"(entry {entry}); regenerate it for this dataset"
+            )
+        program = int(entry["program_length"])
+        wanted = settle_frames(spec, program)
+        kept = min(wanted, int(ep["length"]) - program)
+        capped += wanted > kept
+        recorded += int(ep["length"])
+        settle += kept
+        ep["length"] = program + kept
+        ep["dataset_to_index"] = int(ep["dataset_from_index"]) + ep["length"]
+    if capped:
+        logging.warning(
+            "--settle-steps %s exceeds the recorded settle window of %d of %d episodes; they keep their whole window",
+            spec,
+            capped,
+            len(episodes),
+        )
+    return {
+        "spec": spec,
+        "file": str(path),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "format": SETTLE_WINDOWS_FORMAT,
+        "frames": sum(int(ep["length"]) for ep in episodes),
+        "settle_frames": settle,
+        "recorded_frames": recorded,
+        "capped_episodes": capped,
+    }
+
+
+def describe_settle_steps(settle: dict[str, Any] | None) -> str:
+    """One line for logs and errors: kept, settle and recorded frames of a settle record."""
+    if settle is None:
+        return "all (every recorded frame)"
+    return (
+        f"{settle['spec']} ({settle['file']}, sha256 {settle['sha256'][:12]}): {settle['frames']} of "
+        f"{settle['recorded_frames']} recorded frames, {settle['settle_frames']} of them settle frames; "
+        f"{settle['capped_episodes']} episodes keep their whole recorded window"
+    )
+
+
+def normalize_task_names(
+    task_names: str | Iterable[str] | None,
+    *,
+    dataset_root: str | pathlib.Path | None = None,
+) -> tuple[str, ...] | None:
+    """Canonical ``task_names`` value: sorted unique tuple (with task groups expanded when ``dataset_root`` has
+    ``isg_meta/task_groups.json``), or ``None`` for "all tasks"."""
     if task_names is None:
         return None
     if isinstance(task_names, str):
-        task_names = [task_names]
-    names = tuple(sorted({str(name) for name in task_names}))
+        # Accept comma-separated task / group names (e.g. from shell scripts) as well as individual strings.
+        raw = [part for part in task_names.split(",") if part] if "," in task_names else [task_names]
+    else:
+        raw = [part for item in task_names for part in (str(item).split(",") if "," in str(item) else [str(item)]) if part]
+    if not raw:
+        return None
+    if dataset_root is not None:
+        raw = expand_task_groups(dataset_root, raw) or []
+    names = tuple(sorted({str(name) for name in raw}))
     return names or None
 
 
@@ -90,13 +320,20 @@ def task_subset_key(task_names: str | Iterable[str]) -> str:
     return f"sha256-{digest}"
 
 
-def task_subset_asset_id(repo_id: str, task_names: str | Iterable[str] | None) -> str:
-    """Asset id (norm stats directory) for ``repo_id`` restricted to ``task_names``; ``repo_id`` itself when
-    ``task_names`` is empty."""
+def task_subset_asset_id(
+    repo_id: str,
+    task_names: str | Iterable[str] | None,
+    *,
+    settle_steps: str = "all",
+) -> str:
+    """Asset id (norm stats directory) for ``repo_id`` restricted to ``task_names`` and ``settle_steps``;
+    ``repo_id`` itself when ``task_names`` is empty and ``settle_steps == 'all'``."""
     names = normalize_task_names(task_names)
-    if names is None:
-        return repo_id
-    return f"{repo_id}/{TASK_SUBSETS_DIR_NAME}/{task_subset_key(names)}"
+    spec = parse_settle_steps(settle_steps)
+    base = repo_id if names is None else f"{repo_id}/{TASK_SUBSETS_DIR_NAME}/{task_subset_key(names)}"
+    if spec == "all":
+        return base
+    return f"{base}/{SETTLE_STEPS_DIR_NAME}/{spec}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -313,6 +550,8 @@ def load_prompt_source(assets_dir: str | pathlib.Path) -> str | None:
 
 def _column(table: Any, name: str) -> list:
     """A column of an HF dataset (or the proxy below) as a Python list."""
+    if hasattr(table, "column") and callable(table.column):
+        return table.column(name)
     return table.data.column(name).to_pylist()
 
 
@@ -326,12 +565,28 @@ class _EpisodesByIndex:
     iteration, column access, ``.filter`` and every other attribute).
     """
 
-    def __init__(self, table: datasets.Dataset):
+    def __init__(self, table: datasets.Dataset, overrides: dict[int, dict[str, Any]] | None = None):
         self._table = table
         episode_indices = table.data.column("episode_index").to_pylist()
         self._row_by_episode = {int(ep): row for row, ep in enumerate(episode_indices)}
         if len(self._row_by_episode) != len(episode_indices):
             raise ValueError("Duplicate episode_index values in the episode metadata")
+        self._overrides: dict[int, dict[str, Any]] = {
+            int(ep): dict(values) for ep, values in (overrides or {}).items()
+        }
+
+    def set_overrides(self, overrides: dict[int, dict[str, Any]]) -> None:
+        self._overrides = {int(ep): dict(values) for ep, values in overrides.items()}
+
+    def column(self, name: str) -> list:
+        values = self._table.data.column(name).to_pylist()
+        if not self._overrides:
+            return values
+        eps = self._table.data.column("episode_index").to_pylist()
+        return [
+            self._overrides[int(ep)][name] if int(ep) in self._overrides and name in self._overrides[int(ep)] else val
+            for ep, val in zip(eps, values, strict=True)
+        ]
 
     @property
     def episode_indices(self) -> list[int]:
@@ -340,20 +595,36 @@ class _EpisodesByIndex:
 
     def __getitem__(self, key):
         if isinstance(key, int | np.integer) and not isinstance(key, bool) and key >= 0:
-            row = self._row_by_episode.get(int(key))
+            ep = int(key)
+            row = self._row_by_episode.get(ep)
             if row is None:
                 raise IndexError(
-                    f"episode_index {int(key)} is not in the episode metadata on disk "
+                    f"episode_index {ep} is not in the episode metadata on disk "
                     f"({len(self._row_by_episode)} episodes present)"
                 )
-            return self._table[row]
+            record = dict(self._table[row])
+            if ep in self._overrides:
+                record.update(self._overrides[ep])
+            return record
+        if isinstance(key, int | np.integer) and not isinstance(key, bool) and key < 0:
+            record = dict(self._table[int(key)])
+            ep = int(record["episode_index"])
+            if ep in self._overrides:
+                record.update(self._overrides[ep])
+            return record
+        if isinstance(key, str) and self._overrides:
+            return self.column(key)
         return self._table[key]
 
     def __len__(self) -> int:
         return len(self._table)
 
     def __iter__(self):
-        return iter(self._table)
+        for record in self._table:
+            ep = int(record["episode_index"])
+            if ep in self._overrides:
+                record = {**record, **self._overrides[ep]}
+            yield record
 
     def __getattr__(self, name: str):
         # Only reached for attributes not found on the proxy. Never resolve dunders / private names through
@@ -538,10 +809,14 @@ class _B1KDatasetReader(DatasetReader):
         fast_video_reader: bool = True,
         decoder_threads: int = 1,
         max_open_videos: int = 32,
+        kept_indices: set[int] | None = None,
+        goal_table: dict[int, dict[str, np.ndarray]] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._data_files = [str(path) for path in data_files]
+        self._kept_indices = kept_indices
+        self._goal_table = goal_table
         available = list(self._meta.video_keys)
         if video_keys is None:
             self._video_keys = available
@@ -576,9 +851,20 @@ class _B1KDatasetReader(DatasetReader):
                 result[key] = torch.from_numpy(frames).squeeze(0)  # (H, W, 3) uint8, or (T, H, W, 3) for several
         return result
 
+    def get_item(self, idx) -> dict:
+        item = super().get_item(idx)
+        if self._goal_table is not None:
+            ep_idx = int(item["episode_index"])
+            for key, frame in self._goal_table[ep_idx].items():
+                item[key] = torch.from_numpy(frame)
+        return item
+
     def _load_hf_dataset(self) -> datasets.Dataset:
         features = get_hf_features_from_features(self._meta.features)
         filters = pa_ds.field("episode_index").isin(list(self.episodes)) if self.episodes is not None else None
+        if self._kept_indices is not None:
+            idx_filter = pa_ds.field("index").isin(sorted(self._kept_indices))
+            filters = idx_filter if filters is None else (filters & idx_filter)
         with SuppressProgressBars():
             hf_dataset = datasets.Dataset.from_parquet(self._data_files, filters=filters, features=features)
         hf_dataset.set_transform(hf_transform_to_torch)
@@ -685,6 +971,9 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         *,
         task_names: str | Iterable[str] | None = None,
         episodes: Sequence[int] | None = None,
+        episode_split: str = "none",
+        settle_steps: str | int | float = "all",
+        goal_camera_keys: dict[str, str] | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
         video_backend: str | None = None,
@@ -704,12 +993,30 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         self.repo_id = repo_id
         self.root = pathlib.Path(root)
         self.meta = B1KDatasetMetadata(repo_id, self.root)
-        self.task_names = normalize_task_names(task_names)
+        expanded_tasks = expand_task_groups(self.root, task_names)
+        if task_names is not None and expanded_tasks != (
+            [task_names] if isinstance(task_names, str) else list(task_names)
+        ):
+            logging.info("--data.task-names %s select the tasks %s", list(task_names), expanded_tasks)
+        self.episode_split = resolve_episode_split(self.root, episode_split, expanded_tasks)
+        if self.episode_split is not None:
+            logging.info("Episode split %s", describe_episode_split(self.episode_split))
+            if expanded_tasks is None:
+                expanded_tasks = list(self.episode_split["tasks"])
+        self.task_names = normalize_task_names(expanded_tasks)
         self.task_subset = select_task_subset(self.meta, self.task_names) if self.task_names else None
 
         selected: list[int] | None = None
         if self.task_subset is not None:
             selected = list(self.task_subset.episode_indices)
+        if self.episode_split is not None:
+            split_eps = list(self.episode_split["episodes"])
+            on_disk = set(self.meta.episodes.episode_indices)
+            if missing := [ep for ep in split_eps if ep not in on_disk]:
+                raise ValueError(f"Episodes {missing[:10]}{'...' if len(missing) > 10 else ''} are not in {self.root}")
+            selected = split_eps if selected is None else sorted(set(selected) & set(split_eps))
+            if self.task_subset is not None:
+                self.task_subset = select_task_subset(self.meta, self.task_names, episodes=selected)
         if episodes is not None:
             requested = sorted({int(ep) for ep in episodes})
             on_disk = set(self.meta.episodes.episode_indices)
@@ -725,9 +1032,38 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
                 self.task_subset = select_task_subset(self.meta, self.task_names, episodes=selected)
         self.episodes = selected
 
+        episode_ids = self.episodes if self.episodes is not None else self.meta.episodes.episode_indices
+        episode_dicts = [dict(self.meta.episodes[ep]) for ep in episode_ids]
+        self.recorded_ranges: dict[int, tuple[int, int]] = {
+            int(ep["episode_index"]): (int(ep["dataset_from_index"]), int(ep["dataset_to_index"]))
+            for ep in episode_dicts
+        }
+        self.settle = apply_settle_steps(self.root, settle_steps, episode_dicts)
+        kept_indices: set[int] | None = None
+        if self.settle is not None:
+            logging.info("Settle steps %s", describe_settle_steps(self.settle))
+            self.meta.episodes.set_overrides(
+                {
+                    int(ep["episode_index"]): {
+                        "length": int(ep["length"]),
+                        "dataset_to_index": int(ep["dataset_to_index"]),
+                    }
+                    for ep in episode_dicts
+                }
+            )
+            kept_indices = {
+                idx
+                for ep in episode_dicts
+                for idx in range(int(ep["dataset_from_index"]), int(ep["dataset_to_index"]))
+            }
+
         data_files, video_files = _referenced_files(self.meta, self.episodes)
         _check_files_exist(self.root, data_files, "data")
         _check_files_exist(self.root, video_files, "video")
+
+        goal_table: dict[int, dict[str, np.ndarray]] | None = None
+        if goal_camera_keys:
+            goal_table = self._build_goal_table(episode_ids, goal_camera_keys, tolerance_s)
 
         self.reader = _B1KDatasetReader(
             meta=self.meta,
@@ -743,6 +1079,8 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
             fast_video_reader=fast_video_reader,
             decoder_threads=decoder_threads,
             max_open_videos=max_open_videos,
+            kept_indices=kept_indices,
+            goal_table=goal_table,
         )
         self.reader.load_and_activate()
         logging.info(
@@ -756,6 +1094,58 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
             self.reader.video_keys,
             " with VideoFrameReader" if self.reader._fast_video_keys else " with lerobot's decoder",  # noqa: SLF001
         )
+
+    def _build_goal_table(
+        self,
+        episode_ids: Sequence[int],
+        goal_camera_keys: dict[str, str],
+        tolerance_s: float,
+    ) -> dict[int, dict[str, np.ndarray]]:
+        """Decode the last recorded frame of each requested camera stream per episode once at construction.
+
+        ``goal_camera_keys`` maps ``output_key`` (e.g. ``observation.goal_rgb.zed_link_camera_0``) to the camera's
+        video stream key (e.g. ``observation.rgb.zed_link_camera_0``). Uses ``self.recorded_ranges`` so that even
+        when ``--data.settle-steps`` cuts the episode earlier, the goal image stays the last *recorded* (settled)
+        frame of the episode, matching ACT's ``episode_last`` semantics.
+        """
+        by_file: dict[pathlib.Path, list[int]] = {}
+        for ep_id in episode_ids:
+            by_file.setdefault(self.root / self.meta.get_data_file_path(ep_id), []).append(int(ep_id))
+
+        last_timestamps: dict[int, float] = {}
+        for path, eps in sorted(by_file.items()):
+            target_indices = {self.recorded_ranges[ep_id][1] - 1: ep_id for ep_id in eps}
+            table = pq.read_table(
+                path,
+                columns=["index", "timestamp"],
+                filters=[("index", "in", sorted(target_indices))],
+            )
+            for idx_val, ts_val in zip(table["index"].to_pylist(), table["timestamp"].to_pylist(), strict=True):
+                last_timestamps[target_indices[int(idx_val)]] = float(ts_val)
+            if missing := [ep_id for ep_id in eps if ep_id not in last_timestamps]:
+                raise ValueError(f"Missing last-frame timestamp for episode(s) {missing} in {path}")
+
+        reader = VideoFrameReader(max_open_files=16, decoder_threads=1)
+        table_out: dict[int, dict[str, np.ndarray]] = {}
+        try:
+            for ep_id in episode_ids:
+                ep = self.meta.episodes[ep_id]
+                ts = last_timestamps[int(ep_id)]
+                ep_goals: dict[str, np.ndarray] = {}
+                for out_key, cam_key in goal_camera_keys.items():
+                    from_ts = float(ep[f"videos/{cam_key}/from_timestamp"])
+                    video_path = self.root / self.meta.get_video_file_path(ep_id, cam_key)
+                    frame = reader.read(video_path, [from_ts + ts], tolerance_s)[0]
+                    ep_goals[out_key] = frame
+                table_out[int(ep_id)] = ep_goals
+        finally:
+            reader.close()
+        logging.info(
+            "Goal table (episode_last): %d episodes x %d views decoded",
+            len(table_out),
+            len(goal_camera_keys),
+        )
+        return table_out
 
     @property
     def video_keys(self) -> list[str]:

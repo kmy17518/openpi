@@ -129,6 +129,15 @@ class DataConfig:
     # Permit norm stats / checkpoints without `b1k_metadata.json` (computed before it existed). A recorded mismatch is
     # never bypassed.
     allow_legacy_assets: bool = False
+    # Episode split (`auto` reads `<dataset_root>/isg_meta/train_split.json` if present, `none` disables it, or a file
+    # path) and settle-window truncation (`all`, an integer number of settle frames, or a decimal fraction of the
+    # program length, read from `<dataset_root>/isg_meta/settle_windows.json`).
+    episode_split: str = "auto"
+    settle_steps: str = "all"
+    # Goal-image conditioning as resolved by LeRobotB1KDataConfig (recorded into checkpoints; see that class).
+    goal_views: Sequence[str] = ()
+    goal_source: _b1k_dataset.GoalSource | None = None
+    conditioning_regime: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -393,6 +402,11 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         )
 
 
+# Prompt scaffolds of the conditioning regimes (docs/b1k.md "Goal-image conditioning"): fixed, task-independent text.
+GOAL_PROMPT_SCAFFOLD = "Reach the configuration shown in the goal image."
+PLAIN_PROMPT_SCAFFOLD = "Perform the task."
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotB1KDataConfig(DataConfigFactory):
     robot_config_name: str = tyro.MISSING
@@ -416,20 +430,49 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # Permit unversioned norm stats / checkpoints (no `b1k_metadata.json`) only after checking their robot/action
     # convention yourself; a recorded mismatch is never bypassed. CLI: --data.allow-legacy-assets
     allow_legacy_assets: bool = False
+    # Train on the "train" episodes of the selected tasks listed by an `isg-episode-split/v1` file: `auto`
+    # (`<dataset_root>/isg_meta/train_split.json` if it exists, else no split), `none`, or a file path.
+    # CLI: --data.episode-split auto|none|PATH
+    episode_split: str | None = None
+    # Frames kept after each episode's program (the recorded settle window), cut at load time using
+    # `<dataset_root>/isg_meta/settle_windows.json`: `all` (default: every recorded frame), a number of frames (`0`
+    # keeps the program only) or a decimal fraction of the program length (`0.2`), capped at the recorded window.
+    # Goal images (`goal_source="episode_last"`) stay the last recorded frame. CLI: --data.settle-steps SPEC
+    settle_steps: str | None = None
+    # Goal-image conditioning (docs/b1k.md "Goal-image conditioning"). `goal_views` names robot-config goal views
+    # ("goal_image_0" = head goal, "goal_image_1" / "goal_image_2" = wrist goals); their goal images are fed to the
+    # model's goal image slots, which the model config must declare (`--model.goal-image-keys`, one per view, in this
+    # order). `goal_source` selects where goal images come from: `episode_last` (the last recorded frame of the
+    # episode's own camera stream; works on any LeRobot v3 root, including ISG and the challenge demos), `goal_key`
+    # (the dataset's dedicated `observation.goal_rgb.<camera>_camera_0` stream), or None (auto: `goal_key` if the
+    # dataset ships `observation.goal_rgb.*`, else `episode_last`). `conditioning_regime` fixes the prompt: none / image
+    # use the fixed task-independent scaffold only, language / image_language the scaffold plus the task prompt
+    # (`prompt_source`). CLI:
+    #   --data.goal-views goal_image_0 --data.conditioning-regime image --model.goal-image-keys goal_0_rgb
+    goal_views: Sequence[str] = ()
+    goal_source: _b1k_dataset.GoalSource | None = None
+    conditioning_regime: Literal["none", "language", "image", "image_language"] | None = None
 
     @override
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         base_config = self.base_config or DataConfig()
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         dataset_root = self.dataset_root if self.dataset_root is not None else base_config.dataset_root
-        task_names = _b1k_dataset.normalize_task_names(
-            self.task_names if self.task_names is not None else base_config.task_names
+        raw_tasks = self.task_names if self.task_names is not None else base_config.task_names
+        task_names = _b1k_dataset.normalize_task_names(raw_tasks, dataset_root=dataset_root)
+        episode_split = self.episode_split if self.episode_split is not None else base_config.episode_split
+        settle_steps = _b1k_dataset.parse_settle_steps(
+            self.settle_steps if self.settle_steps is not None else base_config.settle_steps
         )
         prompt_source = self.prompt_source if self.prompt_source is not None else base_config.prompt_source
         asset_id = self.assets.asset_id
         if asset_id is None and repo_id is not None:
-            # A task subset has its own norm stats: `<repo_id>/task_subsets/<key>` (`<repo_id>` for the whole dataset).
-            asset_id = repo_id if isinstance(repo_id, list) else _b1k_dataset.task_subset_asset_id(repo_id, task_names)
+            # A task subset / settle-steps setting has its own norm stats (`<repo_id>` for the whole dataset at `all`).
+            asset_id = (
+                repo_id
+                if isinstance(repo_id, list)
+                else _b1k_dataset.task_subset_asset_id(repo_id, task_names, settle_steps=settle_steps)
+            )
         assets_dir = epath.Path(self.assets.assets_dir or assets_dirs)
         metadata_asset_id = next(iter(asset_id), None) if isinstance(asset_id, list) else asset_id
         norm_stats_metadata = (
@@ -441,6 +484,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             asset_id=asset_id,
             dataset_root=dataset_root,
             task_names=task_names,
+            episode_split=episode_split,
+            settle_steps=settle_steps,
             prompt_source=prompt_source,
             norm_stats=self._load_norm_stats(assets_dir, asset_id),
             norm_stats_metadata=norm_stats_metadata,
@@ -485,6 +530,40 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 repack_mapping[f"observation/{image_key}"] = robot_config.observations[image_key].dataset_key
                 camera_keys.append(robot_config.observations[image_key].dataset_key)
 
+        # Goal-image views: decoded from their own dataset streams (`goal_source="goal_key"`) or from the last
+        # recorded frame of their corresponding camera streams (`goal_source="episode_last"`), never through the
+        # camera enumeration above.
+        goal_views = tuple(self.goal_views)
+        if len(set(goal_views)) != len(goal_views) or set(goal_views) - set(robot_config.goals):
+            raise ValueError(f"goal_views must be distinct entries of the robot config's goals {list(robot_config.goals)}")
+        if self.goal_source is not None and self.goal_source not in _b1k_dataset.GOAL_SOURCES:
+            raise ValueError(f"goal_source must be one of {_b1k_dataset.GOAL_SOURCES}, got {self.goal_source!r}")
+        if self.goal_source is not None and not goal_views:
+            raise ValueError("--data.goal-source requires --data.goal-views")
+        expected_goal_keys = _model.GOAL_IMAGE_KEYS[: len(goal_views)]
+        model_goal_keys = tuple(getattr(model_config, "goal_image_keys", ()))
+        if model_goal_keys != expected_goal_keys:
+            raise ValueError(
+                f"Data config goal_views {list(goal_views)} need model goal_image_keys {list(expected_goal_keys)}, "
+                f"got {list(model_goal_keys)} (pass --model.goal-image-keys accordingly)"
+            )
+        goal_camera_keys: dict[str, str] = {}
+        for view in goal_views:
+            goal_dataset_key = robot_config.goals[view].dataset_key
+            repack_mapping[f"observation/{view}"] = goal_dataset_key
+            if self.goal_source != "episode_last":
+                camera_keys.append(goal_dataset_key)
+            cam_slot = view.removeprefix("goal_")
+            if cam_slot in robot_config.observations:
+                goal_camera_keys[goal_dataset_key] = robot_config.observations[cam_slot].dataset_key
+            else:
+                goal_camera_keys[goal_dataset_key] = goal_dataset_key.replace("observation.goal_rgb.", "observation.rgb.")
+        regime = self.conditioning_regime
+        if regime is not None:
+            wants_goal = regime in ("image", "image_language")
+            if wants_goal != bool(goal_views):
+                raise ValueError(f"conditioning_regime {regime} {'requires' if wants_goal else 'excludes'} goal_views")
+
         # Add non-image observations
         repack_mapping.update(
             {
@@ -499,9 +578,15 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         # Prepare data for policy training
         # Convert images to uint8 numpy arrays, add masks
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1KInputs(robot_config=robot_config, model_type=model_config.model_type)],
+            inputs=[b1k_policy.B1KInputs(robot_config=robot_config, model_type=model_config.model_type, goal_views=goal_views)],
             outputs=[b1k_policy.B1KOutputs(action_dim=robot_config.action_dim)],
         )
+        if regime is not None:
+            # The prompt scaffold is fixed and task-independent; task-dependent text only enters in the language regimes.
+            scaffold = GOAL_PROMPT_SCAFFOLD if goal_views else PLAIN_PROMPT_SCAFFOLD
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.ComposePrompt(scaffold, include_task=regime in ("language", "image_language"))]
+            )
 
         # extra delta transform.
         if self.extra_delta_transform:
@@ -522,6 +607,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         dataset_kwargs = dict(base_config.dataset_kwargs)
         if isinstance(base_config.data_cls, type) and issubclass(base_config.data_cls, _b1k_dataset.B1KLeRobotDataset):
             dataset_kwargs.setdefault("video_keys", camera_keys)
+            if goal_views:
+                dataset_kwargs.setdefault("goal_camera_keys", goal_camera_keys)
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
@@ -530,6 +617,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 robot_config, extra_delta_transform=self.extra_delta_transform
             ),
             allow_legacy_assets=self.allow_legacy_assets,
+            goal_views=goal_views,
+            goal_source=self.goal_source,
+            conditioning_regime=regime,
             dataset_kwargs=dataset_kwargs,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,

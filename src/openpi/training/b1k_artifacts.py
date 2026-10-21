@@ -17,6 +17,8 @@ MODEL_FIELDS = (
     "discrete_state_input",
     "paligemma_variant",
     "action_expert_variant",
+    "goal_image_keys",
+    "goal_role_embedding",
 )
 
 
@@ -68,13 +70,37 @@ def norm_metadata(representation: dict[str, Any]) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "action_representation": representation}
 
 
-def inference_metadata(data_config: Any, model_config: Any, prompts: dict[str, str]) -> dict[str, Any]:
+def inference_metadata(
+    data_config: Any,
+    model_config: Any,
+    prompts: dict[str, str],
+    *,
+    goal_source: str | None = None,
+    episode_split: dict[str, Any] | None = None,
+    settle_steps: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     metadata = norm_metadata(data_config.action_representation)
+    goal_views = list(getattr(data_config, "goal_views", ()) or ())
+    if goal_source is None and goal_views:
+        goal_source = getattr(data_config, "goal_source", None) or "dataset_goal_stream"
     metadata.update(
         prompt_source=data_config.prompt_source,
         task_prompts=prompts,
+        conditioning={
+            "regime": getattr(data_config, "conditioning_regime", None),
+            "goal_views": goal_views,
+            "goal_image_keys": list(getattr(model_config, "goal_image_keys", ()) or ()),
+            "goal_role_embedding": bool(getattr(model_config, "goal_role_embedding", False)),
+            "goal_source": goal_source if goal_views else None,
+            "data_split": episode_split["subset"] if episode_split else "all",
+            "settle_steps": settle_steps["spec"] if settle_steps else getattr(data_config, "settle_steps", "all"),
+        },
+        episode_split=episode_split,
+        settle_steps=settle_steps,
         model_type=model_config.model_type.value,
-        model={field: getattr(model_config, field) for field in MODEL_FIELDS if hasattr(model_config, field)},
+        # tuples become lists so the record equals its JSON round trip
+        model={field: (list(value) if isinstance(value, tuple) else value)
+               for field in MODEL_FIELDS if hasattr(model_config, field) for value in [getattr(model_config, field)]},
     )
     return metadata
 

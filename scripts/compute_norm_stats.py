@@ -59,6 +59,7 @@ _LOWDIM_IRRELEVANT_DATASET_KWARGS = frozenset(
         "fast_video_reader",
         "decoder_threads",
         "max_open_videos",
+        "goal_camera_keys",
     }
 )
 
@@ -219,29 +220,63 @@ def _create_lowdim_dataset(
     # Mirrors `_data_loader.create_b1k_dataset`.
     dataset_kwargs = dict(data_config.dataset_kwargs)
     episodes = dataset_kwargs.pop("episodes", None)
+    goal_camera_keys = dataset_kwargs.pop("goal_camera_keys", None)
     if unsupported := set(dataset_kwargs) - _LOWDIM_IRRELEVANT_DATASET_KWARGS:
         raise NotImplementedError(f"dataset_kwargs {sorted(unsupported)}")
     tolerance_s = dataset_kwargs.get("tolerance_s", 1e-4)
-    if data_config.task_names:
+    expanded_tasks = _b1k_dataset.expand_task_groups(data_config.dataset_root, data_config.task_names)
+    if data_config.task_names and expanded_tasks != list(data_config.task_names):
+        logging.info("--data.task-names %s select the tasks %s", list(data_config.task_names), expanded_tasks)
+    episode_split = _b1k_dataset.resolve_episode_split(
+        data_config.dataset_root, getattr(data_config, "episode_split", "auto"), expanded_tasks
+    )
+    if episode_split is not None:
+        logging.info("Episode split %s", _b1k_dataset.describe_episode_split(episode_split))
+        if expanded_tasks is None:
+            expanded_tasks = list(episode_split["tasks"])
+        split_eps = list(episode_split["episodes"])
+        episodes = split_eps if episodes is None else sorted(set(split_eps) & {int(ep) for ep in episodes})
+    task_names = _b1k_dataset.normalize_task_names(expanded_tasks)
+    if task_names:
         subset = _b1k_dataset.select_task_subset(
             _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root),
-            data_config.task_names,
+            task_names,
             episodes=episodes,
         )
         episodes = list(subset.episode_indices)
     elif episodes is not None:
         episodes = sorted({int(episode) for episode in episodes})
 
+    settle_spec = _b1k_dataset.parse_settle_steps(getattr(data_config, "settle_steps", "all"))
     if data_config.data_cls is _b1k_dataset.B1KLeRobotDataset:
         meta = _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root)
+        if goal_camera_keys:
+            meta.extra_visual_keys = tuple(goal_camera_keys)
         if episodes is not None and not episodes:
             raise ValueError("No episode selected.")
+        if settle_spec != "all":
+            ep_ids = episodes if episodes is not None else meta.episodes.episode_indices
+            ep_dicts = [dict(meta.episodes[ep]) for ep in ep_ids]
+            settle = _b1k_dataset.apply_settle_steps(data_config.dataset_root, settle_spec, ep_dicts)
+            if settle is not None:
+                logging.info("Settle steps %s", _b1k_dataset.describe_settle_steps(settle))
+                meta.episodes.set_overrides(
+                    {
+                        int(ep["episode_index"]): {
+                            "length": int(ep["length"]),
+                            "dataset_to_index": int(ep["dataset_to_index"]),
+                        }
+                        for ep in ep_dicts
+                    }
+                )
         return make(
             meta,
             tolerance_s=tolerance_s,
             episodes=episodes,
             data_files=_lerobot_lowdim.referenced_data_files(meta, episodes),
         )
+    if settle_spec != "all":
+        raise NotImplementedError(f"settle_steps={settle_spec!r} requires B1KLeRobotDataset")
     if data_config.data_cls is _lerobot_compat.LeRobotDataset:
         meta = _lerobot_compat.LeRobotDatasetMetadata(data_config.repo_id, root=data_config.dataset_root)
         if not _lerobot_lowdim.episode_metadata_is_positional(meta):

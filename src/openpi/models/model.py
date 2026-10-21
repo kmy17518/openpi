@@ -43,6 +43,15 @@ IMAGE_KEYS = (
 )
 
 
+# Goal-image slots (goal-image conditioning, "PI-SLOT"): extra images encoded by the same vision encoder and placed
+# after the camera images in the visual prefix, in this fixed order (head goal, left-wrist goal, right-wrist goal).
+# A config selects a prefix of them through `Pi0Config.goal_image_keys`.
+GOAL_IMAGE_KEYS = (
+    "goal_0_rgb",
+    "goal_1_rgb",
+    "goal_2_rgb",
+)
+
 # This may need change if we release a small model.
 IMAGE_RESOLUTION = (224, 224)
 

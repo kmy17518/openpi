@@ -154,11 +154,25 @@ def create_b1k_dataset(
     else:
         dataset_meta = _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root)
         dataset_kwargs = {"repo_id": data_config.repo_id, **data_config.dataset_kwargs}
-        if data_config.task_names:
+        goal_camera_keys = dataset_kwargs.pop("goal_camera_keys", None)
+        expanded_tasks = _b1k_dataset.expand_task_groups(data_config.dataset_root, data_config.task_names)
+        if data_config.task_names and expanded_tasks != list(data_config.task_names):
+            logging.info("--data.task-names %s select the tasks %s", list(data_config.task_names), expanded_tasks)
+        episode_split = _b1k_dataset.resolve_episode_split(
+            data_config.dataset_root, getattr(data_config, "episode_split", "auto"), expanded_tasks
+        )
+        if episode_split is not None:
+            logging.info("Episode split %s", _b1k_dataset.describe_episode_split(episode_split))
+            if expanded_tasks is None:
+                expanded_tasks = list(episode_split["tasks"])
+        task_names = _b1k_dataset.normalize_task_names(expanded_tasks)
+        episodes = dataset_kwargs.get("episodes")
+        if episode_split is not None:
+            split_eps = list(episode_split["episodes"])
+            episodes = split_eps if episodes is None else sorted(set(split_eps) & {int(ep) for ep in episodes})
+        if task_names:
             # Every requested task must have episodes, also within an explicit `episodes` selection.
-            subset = _b1k_dataset.select_task_subset(
-                dataset_meta, data_config.task_names, episodes=dataset_kwargs.get("episodes")
-            )
+            subset = _b1k_dataset.select_task_subset(dataset_meta, task_names, episodes=episodes)
             dataset_kwargs["episodes"] = list(subset.episode_indices)
             logging.info(
                 "Task subset %s (task_index %s): %d of %d episodes under %s",
@@ -168,6 +182,52 @@ def create_b1k_dataset(
                 len(dataset_meta.episodes),
                 data_config.dataset_root,
             )
+        elif episodes is not None:
+            dataset_kwargs["episodes"] = sorted({int(ep) for ep in episodes})
+
+        settle_spec = _b1k_dataset.parse_settle_steps(getattr(data_config, "settle_steps", "all"))
+        if settle_spec != "all":
+            if data_config.data_cls is _b1k_dataset.B1KLeRobotDataset:
+                dataset_kwargs["settle_steps"] = settle_spec
+            else:
+                raise NotImplementedError(f"settle_steps={settle_spec!r} requires B1KLeRobotDataset")
+
+        goal_views = tuple(getattr(data_config, "goal_views", ()) or ())
+        resolved_goal_source: str | None = None
+        if goal_views:
+            goal_source = getattr(data_config, "goal_source", None)
+            if goal_source is None:
+                # Auto-detect: use dedicated `observation.goal_rgb.*` streams if the dataset ships them, else `episode_last`.
+                wanted_goal_streams = set(goal_camera_keys or ())
+                available_streams = set(dataset_meta.video_keys) | set(dataset_meta.camera_keys)
+                resolved_goal_source = (
+                    "dataset_goal_stream"
+                    if wanted_goal_streams and wanted_goal_streams.issubset(available_streams)
+                    else "episode_last"
+                )
+            elif goal_source == "goal_key":
+                wanted_goal_streams = set(goal_camera_keys or ())
+                available_streams = set(dataset_meta.video_keys) | set(dataset_meta.camera_keys)
+                if missing_streams := sorted(wanted_goal_streams - available_streams):
+                    raise ValueError(
+                        f"{data_config.dataset_root}: no metadata for video streams {missing_streams}; "
+                        "goal_source=goal_key needs the dataset's observation.goal_rgb.* streams "
+                        "(use --data.goal-source episode_last otherwise)"
+                    )
+                resolved_goal_source = "goal_key"
+            elif goal_source == "episode_last":
+                resolved_goal_source = "episode_last"
+            else:
+                raise ValueError(f"Unknown goal_source {goal_source!r}; expected one of {_b1k_dataset.GOAL_SOURCES}")
+            if resolved_goal_source == "episode_last":
+                if data_config.data_cls is not _b1k_dataset.B1KLeRobotDataset or not goal_camera_keys:
+                    raise NotImplementedError("goal_source=episode_last requires B1KLeRobotDataset")
+                dataset_kwargs["goal_camera_keys"] = goal_camera_keys
+                if "video_keys" in dataset_kwargs and dataset_kwargs["video_keys"] is not None:
+                    dataset_kwargs["video_keys"] = [
+                        k for k in dataset_kwargs["video_keys"] if k not in set(goal_camera_keys)
+                    ]
+
     dataset = data_config.data_cls(
         root=data_config.dataset_root,
         delta_timestamps={
@@ -186,7 +246,7 @@ def create_b1k_dataset(
             # Only the tasks actually trained on need a prompt: the selected subset, else every task on disk.
             required = (
                 set(subset.task_indices)
-                if data_config.task_names
+                if task_names
                 else set(_b1k_dataset.episode_task_indices(dataset_meta))
             )
             prompts = _b1k_dataset.task_prompts(dataset_meta, data_config.prompt_source, required)
@@ -203,13 +263,31 @@ def create_b1k_dataset(
                     if representation is None
                     else sum(1 if group["is_eef"] else len(group["indices"]) for group in representation["proprio"])
                 )
-                _b1k_dataset.check_prompt_token_lengths(
-                    {i: prompts[i] for i in required}, model_config, state_dim=state_dim
-                )
+                # Under a conditioning regime, ComposePrompt formats the final text fed to the tokenizer.
+                regime = getattr(data_config, "conditioning_regime", None)
+                if regime is not None:
+                    scaffold = _config.GOAL_PROMPT_SCAFFOLD if goal_views else _config.PLAIN_PROMPT_SCAFFOLD
+                    include_task = regime in ("language", "image_language")
+                    checked_prompts = {
+                        i: (f"{scaffold} {prompts[i]}".strip() if include_task else scaffold) for i in required
+                    }
+                else:
+                    checked_prompts = {i: prompts[i] for i in required}
+                _b1k_dataset.check_prompt_token_lengths(checked_prompts, model_config, state_dim=state_dim)
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(prompts)])
     if data_config.action_representation is not None and model_config is not None:
         # Recorded into new checkpoints (`b1k_metadata.json`) so serving restores the exact prompts and model settings.
-        dataset.inference_metadata = _b1k_artifacts.inference_metadata(data_config, model_config, recorded_prompts)
+        settle_record = getattr(dataset, "settle", None) or getattr(
+            getattr(dataset, "_dataset", None), "settle", None
+        )
+        dataset.inference_metadata = _b1k_artifacts.inference_metadata(
+            data_config,
+            model_config,
+            recorded_prompts,
+            goal_source=resolved_goal_source if not isinstance(data_config.repo_id, list) else None,
+            episode_split=episode_split if not isinstance(data_config.repo_id, list) else None,
+            settle_steps=settle_record,
+        )
 
     return dataset
 

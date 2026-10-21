@@ -569,3 +569,212 @@ def test_dataset_decodes_only_selected_rgb_streams(full_root: pathlib.Path, monk
     assert item[rgb].shape == (64, 64, 3)
     # Keys the dataset does not have are ignored (training configs request the robot's cameras blindly).
     assert b1k_dataset.B1KLeRobotDataset("org/demos", full_root, video_keys=["observation.rgb.nope", rgb]).video_keys == [rgb]
+
+
+def _write_task_groups(root: pathlib.Path, groups: dict, fmt: str = "isg-task-groups/v1") -> pathlib.Path:
+    path = root / "isg_meta/task_groups.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"format": fmt, "groups": groups}))
+    return path
+
+
+def _write_episode_split(root: pathlib.Path, train_episodes: dict[str, list[int]], fmt: str = "isg-episode-split/v1") -> pathlib.Path:
+    path = root / "isg_meta/train_split.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tasks = {task: {"train": train, "held_out": []} for task, train in train_episodes.items()}
+    path.write_text(json.dumps({"format": fmt, "name": "tiny", "tasks": tasks}))
+    return path
+
+
+def _write_settle_windows(root: pathlib.Path, programs: dict[int, int], fmt: str = "isg-settle-windows/v1") -> pathlib.Path:
+    meta = b1k_dataset.B1KDatasetMetadata("org/demos", root)
+    lengths = {int(ep["episode_index"]): int(ep["length"]) for ep in meta.episodes}
+    path = root / "isg_meta/settle_windows.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "format": fmt,
+                "episodes": {
+                    str(ep): {"length": lengths[ep], "program_length": prog} for ep, prog in programs.items()
+                },
+            }
+        )
+    )
+    return path
+
+
+def test_task_groups_expand_and_validate(full_root: pathlib.Path):
+    assert b1k_dataset.expand_task_groups(full_root, None) is None
+    assert b1k_dataset.expand_task_groups(full_root, ["picking_up_trash", "typo"]) == ["picking_up_trash", "typo"]
+    _write_task_groups(
+        full_root,
+        {
+            "radios": ["turning_on_radio"],
+            "pair": ["radios", "picking_up_trash"],
+            "all": ["pair", "chop_an_onion"],
+        },
+    )
+    assert b1k_dataset.expand_task_groups(full_root, "radios") == ["turning_on_radio"]
+    assert b1k_dataset.expand_task_groups(full_root, ["all"]) == [
+        "turning_on_radio",
+        "picking_up_trash",
+        "chop_an_onion",
+    ]
+    assert b1k_dataset.expand_task_groups(full_root, ["picking_up_trash", "pair", "turning_on_radio"]) == [
+        "picking_up_trash",
+        "turning_on_radio",
+    ]
+    assert b1k_dataset.normalize_task_names(["pair"], dataset_root=full_root) == (
+        "picking_up_trash",
+        "turning_on_radio",
+    )
+    with pytest.raises(ValueError, match="Unknown task or task group 'typo'"):
+        b1k_dataset.expand_task_groups(full_root, ["turning_on_radio", "typo"])
+    for groups, error in [
+        ({"outer": ["inner"], "inner": ["typo"]}, "Task group 'inner' in .* lists unknown task or group 'typo'"),
+        ({"outer": ["inner"], "inner": ["outer"]}, "Task group cycle outer -> inner -> outer"),
+        (
+            {"outer": ["turning_on_radio"], "turning_on_radio": ["picking_up_trash"]},
+            "'turning_on_radio' is both a task and a task group",
+        ),
+        ({"outer": []}, "Task group 'outer' .* must be a nonempty list"),
+        ({"outer": "turning_on_radio"}, "Task group 'outer' .* must be a nonempty list"),
+    ]:
+        _write_task_groups(full_root, groups)
+        with pytest.raises(ValueError, match=error):
+            b1k_dataset.expand_task_groups(full_root, ["outer"])
+    _write_task_groups(full_root, {}, fmt="isg-task-groups/v0")
+    with pytest.raises(ValueError, match="not an isg-task-groups/v1 task group file"):
+        b1k_dataset.expand_task_groups(full_root, ["turning_on_radio"])
+
+
+def test_episode_split_resolution_and_dataset_filtering(full_root: pathlib.Path, tmp_path: pathlib.Path):
+    assert b1k_dataset.resolve_episode_split(full_root, "auto") is None
+    _write_episode_split(full_root, {"turning_on_radio": [1], "picking_up_trash": [3], "chop_an_onion": [4]})
+    split = b1k_dataset.resolve_episode_split(full_root, "auto")
+    assert split is not None and split["episodes"] == [1, 3, 4]
+    assert b1k_dataset.resolve_episode_split(full_root, "none") is None
+    assert b1k_dataset.resolve_episode_split(full_root, "auto", ["picking_up_trash"])["episodes"] == [3]
+
+    ds = b1k_dataset.B1KLeRobotDataset(
+        "org/demos", full_root, task_names=["turning_on_radio", "picking_up_trash"], episode_split="auto"
+    )
+    assert ds.episodes == [1, 3]
+    assert _episode_indices(ds) == {1, 3}
+    assert len(ds) == 2 * FRAMES_PER_EPISODE
+
+    with pytest.raises(FileNotFoundError, match="missing.json"):
+        b1k_dataset.resolve_episode_split(full_root, str(tmp_path / "missing.json"))
+
+
+def test_settle_steps_parse_and_cut_episodes(full_root: pathlib.Path):
+    for spec, canonical in [
+        ("all", "all"),
+        ("0", "0"),
+        ("010", "10"),
+        (10, "10"),
+        ("0.20", "0.2"),
+        (".5", "0.5"),
+        ("1.", "1.0"),
+        ("1.0", "1.0"),
+        ("0.0", "0.0"),
+    ]:
+        assert b1k_dataset.parse_settle_steps(spec) == canonical
+    for bad in ("-1", "1e-1", "0.2%", "half", "", ".", "none"):
+        with pytest.raises(ValueError, match="--settle-steps must be all, a number of frames"):
+            b1k_dataset.parse_settle_steps(bad)
+    assert b1k_dataset.settle_frames("0.55", 100) == 55
+    assert b1k_dataset.settle_frames("0.2", 7) == 2 and b1k_dataset.settle_frames("1", 7) == 1
+
+    with pytest.raises(FileNotFoundError, match="settle_windows.json"):
+        b1k_dataset.B1KLeRobotDataset("org/demos", full_root, settle_steps="0")
+
+    programs = {0: 5, 1: 4, 2: 6, 3: 3, 4: 8, 5: 7}
+    _write_settle_windows(full_root, programs)
+    delta_timestamps = {"action": [t / FPS for t in range(HORIZON)]}
+    ds0 = b1k_dataset.B1KLeRobotDataset(
+        "org/demos", full_root, task_names="turning_on_radio", settle_steps="0", delta_timestamps=delta_timestamps
+    )
+    assert ds0.settle is not None and ds0.settle["spec"] == "0"
+    assert ds0.settle["frames"] == 9 and ds0.settle["recorded_frames"] == 24
+    assert len(ds0) == 9
+    # Last kept frame of episode 0 is frame_index 4 (the 5th frame); its action chunk is clamped at frame 4 and padded.
+    item4 = ds0[4]
+    assert int(item4["episode_index"]) == 0 and int(item4["frame_index"]) == 4
+    assert item4["action_is_pad"].tolist() == [False, True, True, True, True]
+    assert torch.all(item4["action"][:, 0] == 4.0)
+    # Next item in ds0 is frame 0 of episode 1 (index 12).
+    item5 = ds0[5]
+    assert int(item5["episode_index"]) == 1 and int(item5["frame_index"]) == 0
+
+    # Low-dim norm-stats reader produces identical items and length under settle_steps + task_groups + episode_split.
+    from openpi.training import config
+    from openpi.training import data_loader
+    from scripts import compute_norm_stats
+
+    _write_task_groups(full_root, {"radio_group": ["turning_on_radio"]})
+    _write_episode_split(full_root, {"turning_on_radio": [0, 1]})
+    dc = config.DataConfig(
+        repo_id="org/demos",
+        dataset_root=str(full_root),
+        task_names=["radio_group"],
+        episode_split="auto",
+        settle_steps="0",
+        action_sequence_keys=("action",),
+    )
+    lowdim = compute_norm_stats._create_lowdim_dataset(dc, HORIZON)  # noqa: SLF001
+    train_ds = data_loader.create_b1k_dataset(dc, HORIZON)
+    assert len(lowdim) == len(train_ds) == 9
+    for idx in range(len(lowdim)):
+        span = lowdim.spans[0 if idx < 5 else 1]
+        pos = idx if idx < 5 else idx - 5
+        per_frame, _ = lowdim.episode_items(span, np.asarray([pos]))
+        expected = train_ds[idx]
+        assert torch.equal(per_frame["action"][0], expected["action"])
+        assert torch.equal(per_frame["action_is_pad"][0], expected["action_is_pad"])
+
+
+def test_episode_last_goal_source_keeps_last_recorded_frame_when_settle_steps_cuts_episode(
+    full_root: pathlib.Path, monkeypatch
+):
+    from lerobot.datasets import dataset_reader
+    from openpi.training import config
+    from openpi.training import data_loader
+
+    rgb = "observation.rgb.zed_link_camera_0"
+    _add_video_streams(full_root, {rgb: False})
+    monkeypatch.setattr(dataset_reader.DepthEncoderConfig, "from_video_info", mock.Mock())
+    for chunk in range(3):
+        path = full_root / "videos" / rgb / f"chunk-{chunk:03d}" / "file-000.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    def fake_read(self, path, timestamps, tolerance_s):
+        # Encode the requested timestamp (in 0.1s ticks) into pixel [0, 0, 0] so we can check which frame was decoded.
+        return np.stack([np.full((64, 64, 3), round(ts * 10), dtype=np.uint8) for ts in timestamps])
+
+    monkeypatch.setattr(b1k_dataset.VideoFrameReader, "read", fake_read)
+    _write_settle_windows(full_root, {0: 5, 1: 4, 2: 6, 3: 3, 4: 8, 5: 7})
+
+    model = config.get_config("pi05_b1k").model
+    model = dataclasses.replace(model, goal_image_keys=("goal_0_rgb",))
+    dc = config.LeRobotB1KDataConfig(
+        repo_id="org/demos",
+        dataset_root=str(full_root),
+        robot_config_name="b1k/R1Pro",
+        task_names=["turning_on_radio"],
+        settle_steps="0",
+        goal_views=("goal_image_0",),
+        goal_source="episode_last",
+        conditioning_regime="image",
+        base_config=config.DataConfig(prompt_from_task=True),
+    ).create(full_root / "assets", model)
+    ds = data_loader.create_b1k_dataset(dc, HORIZON, model)
+    assert len(ds) == 9
+    assert ds.inference_metadata["conditioning"]["goal_source"] == "episode_last"
+    assert ds.inference_metadata["conditioning"]["settle_steps"] == "0"
+    # Episode 0 has 12 recorded frames (last recorded frame_index = 11, timestamp = 1.1s, plus from_timestamp = 2.5s -> 3.6s -> 36).
+    sample = ds[2]
+    assert int(sample["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 36
+

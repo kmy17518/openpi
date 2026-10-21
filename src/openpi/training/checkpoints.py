@@ -122,6 +122,9 @@ def restore_state(
             for key in ("task_prompts", "prompt_source", "model_type", "model"):
                 if metadata.get(key) != data_config.inference_metadata.get(key):
                     raise ValueError(f"Resume checkpoint {key} differs from the current training configuration")
+            for key in ("conditioning", "episode_split", "settle_steps"):
+                if key in metadata and metadata.get(key) != data_config.inference_metadata.get(key):
+                    raise ValueError(f"Resume checkpoint {key} differs from the current training configuration")
         _b1k_artifacts.validate_norm_stats(_normalize.load(assets_dir), data_config.norm_stats)
 
     with at.disable_typechecking():

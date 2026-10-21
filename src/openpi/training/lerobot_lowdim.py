@@ -100,6 +100,8 @@ class LowDimLeRobotDataset:
             check_delta_timestamps(delta_timestamps, meta.fps, tolerance_s)
             self.delta_indices = get_delta_indices(delta_timestamps, meta.fps)
         self.visual_keys: list[str] = [*meta.video_keys, *meta.image_keys]
+        if extra_visual_keys := getattr(meta, "extra_visual_keys", ()):
+            self.visual_keys.extend(k for k in extra_visual_keys if k not in self.visual_keys)
         # Position -> task name, like `LeRobotDataset` (`meta.tasks.iloc[task_index].name`).
         self._task_names = np.asarray([str(name) for name in meta.tasks.index], dtype=str)
         self._prompts = _lerobot_compat.tasks_from_metadata(meta) if prompt_from_task else None
@@ -177,15 +179,19 @@ class LowDimLeRobotDataset:
             first_index = int(columns["index"][0])
             if not np.array_equal(columns["index"], np.arange(first_index, first_index + table.num_rows)):
                 raise ValueError(f"Frame indices in {span.data_file} are not contiguous.")
-            # Every selected episode of this file must be exactly the run of rows its metadata announces.
+            # Every selected episode of this file must start at `first_index` and fit within the recorded rows of that
+            # episode (`len(file_span)` may be smaller than the recorded row count when `--data.settle-steps` cuts the
+            # settle window).
             episode_column = columns["episode_index"]
             for file_span in self._spans_by_file[span.data_file]:
                 rows = slice(file_span.first_index - first_index, file_span.end_index - first_index)
+                recorded_count = np.count_nonzero(episode_column == file_span.episode_index)
                 if (
                     rows.start < 0
                     or rows.stop > table.num_rows
                     or np.any(episode_column[rows] != file_span.episode_index)
-                    or np.count_nonzero(episode_column == file_span.episode_index) != len(file_span)
+                    or recorded_count < len(file_span)
+                    or (rows.start > 0 and episode_column[rows.start - 1] == file_span.episode_index)
                 ):
                     raise ValueError(
                         f"Rows of episode {file_span.episode_index} in {span.data_file} do not match its metadata."
@@ -461,6 +467,8 @@ def episode_metadata_is_positional(meta: Any) -> bool:
 
 def _metadata_column(episodes: Any, name: str) -> np.ndarray:
     """A column of the episode metadata (a HF `Dataset` or a pandas `DataFrame`, depending on the LeRobot version)."""
+    if hasattr(episodes, "column") and callable(episodes.column):
+        return np.asarray(episodes.column(name))
     if hasattr(episodes, "data") and hasattr(episodes.data, "column"):
         return np.asarray(episodes.data.column(name).to_numpy())
     return np.asarray(episodes[name])
