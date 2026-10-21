@@ -237,6 +237,16 @@ def _create_lowdim_dataset(
         split_eps = list(episode_split["episodes"])
         episodes = split_eps if episodes is None else sorted(set(split_eps) & {int(ep) for ep in episodes})
     task_names = _b1k_dataset.normalize_task_names(expanded_tasks)
+    if data_config.val_fraction:
+        val_split = _b1k_dataset.resolve_val_split(
+            _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root),
+            task_names,
+            data_config.val_fraction,
+            data_config.val_seed,
+            episodes=episodes,
+        )
+        logging.info("Validation split %s", _b1k_dataset.describe_val_split(val_split))
+        episodes = val_split["train_episodes"]
     if task_names:
         subset = _b1k_dataset.select_task_subset(
             _b1k_dataset.B1KDatasetMetadata(data_config.repo_id, data_config.dataset_root),
@@ -363,6 +373,9 @@ class Args:
     # (which decodes every camera stream). Same batches, same statistics, orders of magnitude faster; --no-fast uses
     # the regular data loader (also used automatically for datasets the fast path does not support).
     fast: bool = True
+    # Training seed (default: the config's), which selects the validation episodes of --data.val-fraction; pass the
+    # same --seed as train_b1k.py.
+    seed: int | None = None
 
 
 def cli(argv: Sequence[str] | None = None) -> Args:
@@ -389,7 +402,8 @@ def cli(argv: Sequence[str] | None = None) -> Args:
 
 
 def main(args: Args):
-    config = dataclasses.replace(_config.get_config(args.config_name), data=args.data)
+    config = _config.get_config(args.config_name)
+    config = dataclasses.replace(config, data=args.data, seed=config.seed if args.seed is None else args.seed)
     max_frames = args.max_frames
     data_config = config.data.create(config.assets_dirs, config.model)
     keys = ["state", "actions"]

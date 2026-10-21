@@ -144,7 +144,8 @@ def create_b1k_dataset(
     loaded (resolved against `meta/tasks.parquet` / `meta/episodes/`, so a misspelled name or a partial download
     of other tasks fails here rather than mid-training). Prompts follow `data_config.prompt_source` (task name or
     natural-language description); when `model_config` is given, prompts that would not fit its `max_token_len`
-    are rejected up front. With an episode split, `subset` selects its `train` or `held_out` episodes.
+    are rejected up front. With an episode split, `subset` selects its `train` or `held_out` episodes; with
+    `data_config.val_fraction`, `train` excludes the validation episodes and `val` selects them.
     """
     if data_config.dataset_root is None:
         raise ValueError("dataset_root is not set. Pass --data.dataset-root=<local LeRobot root> for B1K datasets.")
@@ -163,13 +164,16 @@ def create_b1k_dataset(
         if data_config.task_names and expanded_tasks != list(data_config.task_names):
             logging.info("--data.task-names %s select the tasks %s", list(data_config.task_names), expanded_tasks)
         episode_split = _b1k_dataset.resolve_episode_split(
-            data_config.dataset_root, getattr(data_config, "episode_split", "auto"), expanded_tasks, subset=subset
+            data_config.dataset_root,
+            getattr(data_config, "episode_split", "auto"),
+            expanded_tasks,
+            subset="train" if subset == "val" else subset,
         )
         if episode_split is not None:
             logging.info("Episode split %s", _b1k_dataset.describe_episode_split(episode_split))
             # every task of the file without task names; held_out drops the tasks that have no held-out episode
             expanded_tasks = list(episode_split["tasks"])
-        elif subset != "train":
+        elif subset == "held_out":
             raise ValueError(
                 f"The {subset} episodes need an episode split (--data.episode-split); {data_config.dataset_root} has none"
             )
@@ -178,6 +182,20 @@ def create_b1k_dataset(
         if episode_split is not None:
             split_eps = list(episode_split["episodes"])
             episodes = split_eps if episodes is None else sorted(set(split_eps) & {int(ep) for ep in episodes})
+        val_split = None
+        if subset != "held_out":
+            val_split = _b1k_dataset.resolve_val_split(
+                dataset_meta,
+                task_names,
+                getattr(data_config, "val_fraction", 0.0),
+                getattr(data_config, "val_seed", None),
+                episodes=episodes,
+            )
+            if val_split is not None:
+                logging.info("Validation split %s", _b1k_dataset.describe_val_split(val_split))
+                episodes = val_split[f"{subset}_episodes"]
+            elif subset == "val":
+                raise ValueError("The val episodes need --data.val-fraction > 0")
         if task_names:
             # Every requested task must have episodes, also within an explicit `episodes` selection.
             subset = _b1k_dataset.select_task_subset(dataset_meta, task_names, episodes=episodes)
@@ -295,6 +313,7 @@ def create_b1k_dataset(
             goal_source=resolved_goal_source if not isinstance(data_config.repo_id, list) else None,
             episode_split=episode_split if not isinstance(data_config.repo_id, list) else None,
             settle_steps=settle_record,
+            val_split=val_split if not isinstance(data_config.repo_id, list) else None,
         )
 
     return dataset
@@ -489,12 +508,15 @@ def load_b1k_fixed_batches(
     num_batches: int,
     seed: int,
     num_workers: int = 0,
-) -> tuple[list[dict], str]:
+    num_samples: int = 0,
+) -> tuple[list[dict], tuple[dict, list[str]] | None, str]:
     """Transformed batches of a fixed selection of frames of the `subset` episodes, loaded once.
 
     `num_batches` batches of `batch_size` frames (fewer when the episodes hold fewer frames) spread over every
     episode by `b1k_dataset.spread_frame_indices` with `seed`, so each call returns the same frames. Transforms and
-    norm stats are those of `data_config`. Returns the collated numpy batches and a description for logs.
+    norm stats are those of `data_config`. Returns the collated numpy batches; one collated batch of `num_samples`
+    frames of different episodes (`b1k_dataset.figure_frame_indices`) with a title per frame, or None without
+    samples; and a description for logs.
     """
     dataset = create_b1k_dataset(data_config, model_config.action_horizon, model_config, subset=subset)
     frames = getattr(dataset, "_dataset", dataset)
@@ -503,8 +525,20 @@ def load_b1k_fixed_batches(
     rows = rows[: len(rows) // batch_size * batch_size]
     if not rows:
         raise ValueError(f"The {subset} episodes hold {len(episode_index)} frames, fewer than a batch of {batch_size}")
+    transformed = transform_dataset(dataset, data_config)
+    samples = None
+    if num_samples:
+        sample_rows = _b1k_dataset.figure_frame_indices(episode_index, num_samples, seed)
+        task_names = _b1k_dataset.task_names_by_index(frames.meta.tasks)
+        task_index = frames.hf_dataset.data.column("task_index").to_numpy()
+        frame_index = frames.hf_dataset.data.column("frame_index").to_numpy()
+        titles = [
+            f"{task_names[int(task_index[row])]}  episode {episode_index[row]}  frame {frame_index[row]}"
+            for row in sample_rows
+        ]
+        samples = (_collate_fn([transformed[row] for row in sample_rows]), titles)
     loader = torch.utils.data.DataLoader(
-        torch.utils.data.Subset(transform_dataset(dataset, data_config), rows),
+        torch.utils.data.Subset(transformed, rows),
         batch_size=batch_size,
         shuffle=False,
         num_workers=min(num_workers, len(rows) // batch_size),
@@ -517,7 +551,7 @@ def load_b1k_fixed_batches(
         f"{len(rows)} frames ({len(batches)} batches of {batch_size}, seed {seed}) of the {subset} episodes: "
         f"{len(np.unique(episode_index))} episodes, {len(episode_index)} frames"
     )
-    return batches, description
+    return batches, samples, description
 
 
 def create_torch_data_loader(

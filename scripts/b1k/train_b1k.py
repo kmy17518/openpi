@@ -1,6 +1,7 @@
 from collections.abc import Callable
 import dataclasses
 import functools
+import importlib.util
 import logging
 import platform
 import time
@@ -18,8 +19,10 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
+import openpi.policies.b1k_policy as _b1k_policy
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+import openpi.training.b1k_figures as _b1k_figures
 import openpi.training.b1k_loss as _b1k_loss
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
@@ -28,19 +31,23 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import openpi.transforms as _transforms
 
 # Validation draws its flow-matching noise and times from this offset of --seed, apart from the training RNG.
 VALIDATION_SEED_OFFSET = 1000
+VALIDATION_FIGURE_SAMPLES = 4
 
 
 def _validation_data(config: _config.TrainConfig, data_config: _config.DataConfig) -> tuple[_config.DataConfig, str]:
     """(data config, episode subset) of the validation frames, with the training norm stats: the training data's
-    held-out episodes (--val-held-out), or the episodes of --val-repo-id."""
+    held-out episodes (--val-held-out), the episodes of --val-repo-id, or the --data.val-fraction episodes."""
     if config.val_held_out:
         return data_config, "held_out"
     if config.val_repo_id is None:
-        raise ValueError("--val-log-interval needs --val-held-out or --val-repo-id")
-    factory = dataclasses.replace(config.data, repo_id=config.val_repo_id)
+        if data_config.val_fraction:
+            return data_config, "val"
+        raise ValueError("--val-log-interval needs --data.val-fraction, --val-held-out or --val-repo-id")
+    factory = dataclasses.replace(config.data, repo_id=config.val_repo_id, val_fraction=0.0)
     val_data_config = dataclasses.replace(
         factory.create(config.assets_dirs, config.model),
         norm_stats=data_config.norm_stats,
@@ -60,15 +67,21 @@ def create_validation(
     train_state_sharding: Any,
     data_sharding: jax.sharding.NamedSharding,
     replicated_sharding: jax.sharding.NamedSharding,
-) -> Callable[[training_utils.TrainState], dict[str, float]]:
-    """Validation loss, set up once: the same seeded frames spread over every validation episode and the same
-    noise and flow-matching times at each evaluation, the masked loss of the params a checkpoint serves (the EMA
-    params when training keeps them), batches sharded like the training data."""
+) -> Callable[[training_utils.TrainState], dict[str, Any]]:
+    """Validation loss and action figures, set up once: the same seeded frames spread over every validation episode
+    and the same noise and flow-matching times at each evaluation, the masked loss of the params a checkpoint serves
+    (the EMA params when training keeps them), batches sharded like the training data. The `val/actions/sample_<i>`
+    figures show the predicted and ground-truth action chunks of fixed frames of different validation episodes in
+    action units."""
     val_data_config, subset = _validation_data(config, data_config)
     batch_size = config.val_batch_size or config.batch_size
     if batch_size % jax.device_count() != 0:
         raise ValueError(f"Validation batch size {batch_size} must be divisible by {jax.device_count()} devices")
-    batches, description = _data_loader.load_b1k_fixed_batches(
+    num_samples = VALIDATION_FIGURE_SAMPLES
+    if importlib.util.find_spec("matplotlib") is None:
+        logging.warning("matplotlib is not installed: no val/actions figures")
+        num_samples = 0
+    batches, samples, description = _data_loader.load_b1k_fixed_batches(
         val_data_config,
         config.model,
         subset=subset,
@@ -76,6 +89,7 @@ def create_validation(
         num_batches=config.val_num_batches,
         seed=config.seed,
         num_workers=config.num_workers,
+        num_samples=num_samples,
     )
     logging.info("Validation on %s", description)
 
@@ -87,15 +101,59 @@ def create_validation(
         chunked_loss = model.compute_loss(rng, observation, actions, train=False)
         return _b1k_loss.masked_mean(chunked_loss, action_is_pad)
 
+    def sample_step(state: training_utils.TrainState, observation: _model.Observation, rng: at.KeyArrayLike):
+        params = state.params if state.ema_params is None else state.ema_params
+        model = nnx.merge(state.model_def, params)
+        model.eval()
+        return model.sample_actions(rng, observation)
+
     pvalidation_step = jax.jit(
         validation_step,
         in_shardings=(train_state_sharding, data_sharding, replicated_sharding),
         out_shardings=replicated_sharding,
     )
+    # The few figure frames need not divide the device count, so they are replicated.
+    psample_step = jax.jit(
+        sample_step,
+        in_shardings=(train_state_sharding, replicated_sharding, replicated_sharding),
+        out_shardings=replicated_sharding,
+    )
     val_rng = jax.random.key(config.seed + VALIDATION_SEED_OFFSET)
     rngs = [jax.random.fold_in(val_rng, i) for i in range(len(batches))]
+    sample_rng = jax.random.fold_in(val_rng, len(batches))
+    # Prediction and ground truth in action units, as served but without the gripper snap.
+    to_action_units = _transforms.compose(
+        [
+            _transforms.Unnormalize(val_data_config.norm_stats, use_quantiles=val_data_config.use_quantile_norm),
+            *(
+                dataclasses.replace(transform, gripper_snap_threshold=None)
+                if isinstance(transform, _b1k_policy.B1KOutputs)
+                else transform
+                for transform in val_data_config.data_transforms.outputs
+            ),
+        ]
+    )
 
-    def validate(state: training_utils.TrainState) -> dict[str, float]:
+    def action_figures(state: training_utils.TrainState) -> dict[str, wandb.Image]:
+        batch, titles = samples
+        arrays = jax.tree.map(lambda x: jax.make_array_from_process_local_data(replicated_sharding, x), batch)
+        with sharding.set_mesh(mesh):
+            predicted = np.asarray(
+                jax.device_get(psample_step(state, _model.Observation.from_dict(arrays), sample_rng)), np.float32
+            )
+        is_pad = batch.get("action_is_pad", np.zeros(batch["actions"].shape[:2], bool))
+        figures = {}
+        for i, title in enumerate(titles):
+            state_i = np.asarray(batch["state"][i])
+            prediction = to_action_units({"state": state_i, "actions": np.array(predicted[i])})["actions"]
+            target = to_action_units({"state": state_i, "actions": np.array(batch["actions"][i])})["actions"]
+            image = _b1k_figures.figure_image(
+                _b1k_figures.action_chunk_figure(prediction, target, ~np.asarray(is_pad[i]), title)
+            )
+            figures[f"val/actions/sample_{i}"] = wandb.Image(image)
+        return figures
+
+    def validate(state: training_utils.TrainState) -> dict[str, Any]:
         losses = []
         for batch, rng in zip(batches, rngs, strict=True):
             arrays = jax.tree.map(lambda x: jax.make_array_from_process_local_data(data_sharding, x), batch)
@@ -105,7 +163,10 @@ def create_validation(
             inputs = (_model.Observation.from_dict(arrays), arrays["actions"], is_pad)
             with sharding.set_mesh(mesh):
                 losses.append(pvalidation_step(state, inputs, rng))
-        return {"val/loss": float(np.mean(jax.device_get(losses)))}
+        info: dict[str, Any] = {"val/loss": float(np.mean(jax.device_get(losses)))}
+        if samples is not None:
+            info.update(action_figures(state))
+        return info
 
     return validate
 
@@ -366,7 +427,9 @@ def main(config: _config.TrainConfig):
             val_start = time.perf_counter()
             val_info = validate(train_state)
             val_info["val/seconds"] = time.perf_counter() - val_start
-            pbar.write(f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in val_info.items()))
+            pbar.write(
+                f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in val_info.items() if isinstance(v, float))
+            )
             wandb.log(val_info, step=step)
         batch = next(data_iter)
 

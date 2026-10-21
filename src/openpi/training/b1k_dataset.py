@@ -80,6 +80,8 @@ TASK_GROUPS_FILE = "isg_meta/task_groups.json"
 TASK_GROUPS_FORMAT = "isg-task-groups/v1"
 SETTLE_WINDOWS_FILE = "isg_meta/settle_windows.json"
 SETTLE_WINDOWS_FORMAT = "isg-settle-windows/v1"
+# Same record and episodes as ACT's `resolve_val_split` (b1k_training.py) for the same seed, tasks and fraction.
+VAL_SPLIT_FORMAT = "isg-val-split/v1"
 
 # Norm stats of a task subset live under ``<repo_id>/task_subsets/<key>/`` (mirrors the GR00T baseline's
 # ``meta/task_subsets/<key>/``), so per-task statistics never shadow the dataset-wide ones and different
@@ -87,6 +89,8 @@ SETTLE_WINDOWS_FORMAT = "isg-settle-windows/v1"
 TASK_SUBSETS_DIR_NAME = "task_subsets"
 SETTLE_STEPS_DIR_NAME = "settle_steps"
 GRIPPER_ACTION_DIR_NAME = "gripper_action"
+VAL_FRACTION_DIR_NAME = "val_fraction"
+SEED_DIR_NAME = "seed"
 _TASK_SUBSET_KEY_SEPARATOR = "+"
 _TASK_SUBSET_KEY_SAFE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
 _TASK_SUBSET_KEY_MAX_LEN = 96
@@ -233,6 +237,16 @@ def spread_frame_indices(episode_index: Sequence[int] | np.ndarray, count: int, 
     return rows
 
 
+def figure_frame_indices(episode_index: Sequence[int] | np.ndarray, count: int, seed: int) -> list[int]:
+    """Row positions of one seeded frame in each of ``count`` seeded episodes (every episode when there are fewer),
+    the same for the same rows and ``seed``."""
+    episode_index = np.asarray(episode_index)
+    episodes = np.unique(episode_index)
+    rng = np.random.default_rng(seed)
+    picks = np.sort(rng.choice(len(episodes), min(count, len(episodes)), replace=False))
+    return [int(rng.choice(np.flatnonzero(episode_index == episodes[i]))) for i in picks]
+
+
 def describe_episode_split(split: dict[str, Any] | None) -> str:
     """One line for logs and errors: name, file, number of episodes and tasks of a split record."""
     if split is None:
@@ -240,6 +254,86 @@ def describe_episode_split(split: dict[str, Any] | None) -> str:
     return (
         f"{split['name']} ({split['file']}, sha256 {split['sha256'][:12]}): {len(split['episodes'])} "
         f"{split['subset']} episodes of tasks {split['tasks']}"
+    )
+
+
+def split_val_episodes(
+    episodes_by_task: dict[str, Iterable[int]], val_fraction: float, seed: int
+) -> dict[str, dict[str, list[int]]]:
+    """``{task: {"train": [...], "val": [...]}}``: each task's episodes permuted with
+    ``SeedSequence([seed, sha256(task)])``, the first ``round(N * val_fraction)`` (at least 1, at most N - 1) of
+    them validation episodes."""
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError(f"--data.val-fraction must be in [0, 1); got {val_fraction}")
+    by_task = {}
+    for task_name, task_episodes in episodes_by_task.items():
+        episodes = sorted(int(ep) for ep in task_episodes)
+        if len(episodes) < 2:
+            raise ValueError(
+                f"Task {task_name!r} has {len(episodes)} episode(s); at least 2 are required for "
+                f"--data.val-fraction {val_fraction}"
+            )
+        n_val = min(len(episodes) - 1, max(1, round(len(episodes) * val_fraction)))
+        task_seed = int.from_bytes(hashlib.sha256(task_name.encode()).digest()[:8], "little")
+        rng = np.random.default_rng(np.random.SeedSequence([int(seed), task_seed]))
+        perm = [episodes[i] for i in rng.permutation(len(episodes))]
+        by_task[task_name] = {"train": sorted(perm[n_val:]), "val": sorted(perm[:n_val])}
+    return by_task
+
+
+def resolve_val_split(
+    meta: LeRobotDatasetMetadata,
+    task_names: Iterable[str] | None,
+    val_fraction: float,
+    seed: int | None,
+    *,
+    episodes: Iterable[int] | None = None,
+) -> dict[str, Any] | None:
+    """Per-task train/val episode split of ``--data.val-fraction`` as a JSON-serializable record, or None when the
+    fraction is 0.
+
+    The candidates of a task are its episodes on disk, restricted to ``task_names`` (every task when None) and to
+    ``episodes`` (e.g. an episode split's ``train`` list) when given; see :func:`split_val_episodes`.
+    """
+    if not val_fraction:
+        return None
+    if seed is None:
+        raise ValueError("--data.val-fraction needs the training seed (TrainConfig.seed)")
+    names = task_names_by_index(meta.tasks)
+    if "task_index" in meta.episodes.column_names:
+        episode_tasks = [int(task) for task in _column(meta.episodes, "task_index")]
+    else:
+        by_name = {name: index for index, name in names.items()}
+        episode_tasks = []
+        for tasks in _column(meta.episodes, "tasks"):
+            if not tasks or len(tasks) != 1 or str(tasks[0]) not in by_name:
+                raise ValueError(f"{meta.root}: each episode needs one known task or an explicit task_index")
+            episode_tasks.append(by_name[str(tasks[0])])
+    selected = None if task_names is None else set(task_names)
+    allowed = None if episodes is None else {int(ep) for ep in episodes}
+    by_task: dict[int, list[int]] = {}
+    for ep, task in zip(_column(meta.episodes, "episode_index"), episode_tasks, strict=True):
+        if (selected is None or names[task] in selected) and (allowed is None or int(ep) in allowed):
+            by_task.setdefault(task, []).append(int(ep))
+    tasks = split_val_episodes({names[task]: by_task[task] for task in sorted(by_task)}, val_fraction, seed)
+    return {
+        "format": VAL_SPLIT_FORMAT,
+        "val_fraction": float(val_fraction),
+        "seed": int(seed),
+        "tasks": tasks,
+        "train_episodes": sorted(ep for entry in tasks.values() for ep in entry["train"]),
+        "val_episodes": sorted(ep for entry in tasks.values() for ep in entry["val"]),
+    }
+
+
+def describe_val_split(val_split: dict[str, Any] | None) -> str:
+    """One line for logs: fraction, seed, train/val episode counts and task count."""
+    if val_split is None:
+        return "no validation split"
+    return (
+        f"val_fraction={val_split['val_fraction']} (seed {val_split['seed']}): "
+        f"{len(val_split['train_episodes'])} train / {len(val_split['val_episodes'])} val episodes "
+        f"across {len(val_split['tasks'])} tasks"
     )
 
 
@@ -378,10 +472,12 @@ def task_subset_asset_id(
     *,
     settle_steps: str = "all",
     gripper_action: str = "absolute",
+    val_fraction: float = 0.0,
+    seed: int | None = None,
 ) -> str:
     """Asset id (norm stats directory) for ``repo_id`` restricted to ``task_names`` and ``settle_steps``, under
-    ``gripper_action``; ``repo_id`` itself when ``task_names`` is empty, ``settle_steps == 'all'`` and the gripper
-    actions are absolute."""
+    ``gripper_action``, without the validation episodes of ``val_fraction`` and ``seed``; ``repo_id`` itself when
+    ``task_names`` is empty, ``settle_steps == 'all'``, the gripper actions are absolute and ``val_fraction`` is 0."""
     names = normalize_task_names(task_names)
     spec = parse_settle_steps(settle_steps)
     asset_id = repo_id if names is None else f"{repo_id}/{TASK_SUBSETS_DIR_NAME}/{task_subset_key(names)}"
@@ -389,6 +485,8 @@ def task_subset_asset_id(
         asset_id = f"{asset_id}/{SETTLE_STEPS_DIR_NAME}/{spec}"
     if gripper_action != "absolute":
         asset_id = f"{asset_id}/{GRIPPER_ACTION_DIR_NAME}/{gripper_action}"
+    if val_fraction:
+        asset_id = f"{asset_id}/{VAL_FRACTION_DIR_NAME}/{float(val_fraction)}/{SEED_DIR_NAME}/{seed}"
     return asset_id
 
 

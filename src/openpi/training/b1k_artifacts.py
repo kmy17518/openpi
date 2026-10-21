@@ -84,6 +84,7 @@ def inference_metadata(
     goal_source: str | None = None,
     episode_split: dict[str, Any] | None = None,
     settle_steps: dict[str, Any] | None = None,
+    val_split: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata = norm_metadata(data_config.action_representation)
     goal_views = list(getattr(data_config, "goal_views", ()) or ())
@@ -103,6 +104,7 @@ def inference_metadata(
         },
         episode_split=episode_split,
         settle_steps=settle_steps,
+        val_split=val_split,
         model_type=model_config.model_type.value,
         # tuples become lists so the record equals its JSON round trip
         model={field: (list(value) if isinstance(value, tuple) else value)
