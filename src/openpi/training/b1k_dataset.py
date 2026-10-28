@@ -68,10 +68,16 @@ TASK_REGISTRY_BUCKET = "b1k"
 #                   when --data.settle-steps cuts the episode earlier; works on any LeRobot v3 root, including the
 #                   challenge demos and ISG);
 #   goal_key     -- a dedicated goal video stream shipped by the dataset (`observation.goal_rgb.<camera>_camera_0`,
-#                   static per episode, as in the radio skill-segment datasets).
-GoalSource = Literal["episode_last", "goal_key"]
+#                   static per episode, as in the radio skill-segment datasets);
+#   norobot_last -- the episode's last recorded state re-rendered with the robot hidden (the dataset's sidecar
+#                   `isg_meta/goal_norobot/<camera>/<episode:06d>.png` + manifest.json, format isg-goal-norobot/v1,
+#                   from train85/work/goal_norobot/render_goals.py): the same camera and scene state as episode_last
+#                   without the robot's arms and torso in the view.
+GoalSource = Literal["episode_last", "goal_key", "norobot_last"]
 GOAL_SOURCES: tuple[str, ...] = get_args(GoalSource)
 DEFAULT_GOAL_SOURCE: GoalSource = "episode_last"
+GOAL_NOROBOT_DIR = "isg_meta/goal_norobot"
+GOAL_NOROBOT_FORMAT = "isg-goal-norobot/v1"
 
 EPISODE_SPLIT_FILE = "isg_meta/train_split.json"
 EPISODE_SPLIT_FORMAT = "isg-episode-split/v1"
@@ -1128,6 +1134,7 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         episode_split: str = "none",
         settle_steps: str | int | float = "all",
         goal_camera_keys: dict[str, str] | None = None,
+        goal_source: GoalSource = DEFAULT_GOAL_SOURCE,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
         video_backend: str | None = None,
@@ -1216,8 +1223,12 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         _check_files_exist(self.root, video_files, "video")
 
         goal_table: dict[int, dict[str, np.ndarray]] | None = None
+        self.goal_source = goal_source
         if goal_camera_keys:
-            goal_table = self._build_goal_table(episode_ids, goal_camera_keys, tolerance_s)
+            if goal_source == "norobot_last":
+                goal_table = self._load_norobot_goal_table(episode_ids, goal_camera_keys)
+            else:
+                goal_table = self._build_goal_table(episode_ids, goal_camera_keys, tolerance_s)
 
         self.reader = _B1KDatasetReader(
             meta=self.meta,
@@ -1298,6 +1309,54 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
             "Goal table (episode_last): %d episodes x %d views decoded",
             len(table_out),
             len(goal_camera_keys),
+        )
+        return table_out
+
+    def _load_norobot_goal_table(
+        self, episode_ids: Sequence[int], goal_camera_keys: dict[str, str]
+    ) -> dict[int, dict[str, np.ndarray]]:
+        """Read each requested camera's robot-free goal image per episode from the dataset's ``isg_meta/goal_norobot``
+        sidecar (``manifest.json`` + ``<camera>/<episode:06d>.png``), the same shape as the camera stream's frames.
+
+        ``goal_camera_keys`` maps ``output_key`` to the camera's video stream key as for ``episode_last``; the camera
+        name is the stream key's middle part (``observation.rgb.zed_link_camera_0`` -> ``zed_link``).
+        """
+        from PIL import Image
+
+        sidecar = self.root / GOAL_NOROBOT_DIR
+        manifest_path = sidecar / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"goal_source=norobot_last needs {manifest_path} (the robot-free goal images rendered from the demos' "
+                "last states: train85/work/goal_norobot); this dataset copy has none"
+            )
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("format") != GOAL_NOROBOT_FORMAT:
+            raise ValueError(f"{manifest_path}: format {manifest.get('format')!r}, expected {GOAL_NOROBOT_FORMAT}")
+        entries = manifest["episodes"]
+        table_out: dict[int, dict[str, np.ndarray]] = {}
+        for ep_id in episode_ids:
+            entry = entries.get(str(int(ep_id)))
+            if entry is None:
+                raise ValueError(f"{manifest_path} has no robot-free goal image for episode {ep_id}")
+            ep_goals: dict[str, np.ndarray] = {}
+            for out_key, cam_key in goal_camera_keys.items():
+                camera = cam_key.removeprefix("observation.rgb.").removesuffix("_camera_0")
+                if camera not in entry:
+                    raise ValueError(f"{manifest_path}: episode {ep_id} has no {camera} goal image (cameras {sorted(entry)})")
+                path = sidecar / entry[camera]["path"]
+                frame = np.asarray(Image.open(path).convert("RGB"))
+                expected = tuple(self.meta.features[cam_key]["shape"])
+                if frame.shape != expected:
+                    raise ValueError(f"{path}: shape {frame.shape}, the {cam_key} stream has {expected}")
+                ep_goals[out_key] = frame
+            table_out[int(ep_id)] = ep_goals
+        logging.info(
+            "Goal table (norobot_last, %s): %d episodes x %d views read from %s",
+            manifest.get("render", {}).get("renderer", "renders of the demos' last states"),
+            len(table_out),
+            len(goal_camera_keys),
+            sidecar,
         )
         return table_out
 

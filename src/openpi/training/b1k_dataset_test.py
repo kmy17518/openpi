@@ -991,3 +991,74 @@ def test_episode_last_goal_source_keeps_last_recorded_frame_when_settle_steps_cu
     sample = ds[2]
     assert int(sample["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 36
 
+
+
+def test_norobot_last_goal_source_reads_the_sidecar_images(full_root: pathlib.Path, monkeypatch):
+    from PIL import Image
+    from lerobot.datasets import dataset_reader
+    from openpi.training import config
+    from openpi.training import data_loader
+
+    rgb = "observation.rgb.zed_link_camera_0"
+    _add_video_streams(full_root, {rgb: False})
+    monkeypatch.setattr(dataset_reader.DepthEncoderConfig, "from_video_info", mock.Mock())
+    for chunk in range(3):
+        path = full_root / "videos" / rgb / f"chunk-{chunk:03d}" / "file-000.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    monkeypatch.setattr(
+        b1k_dataset.VideoFrameReader,
+        "read",
+        lambda self, path, timestamps, tolerance_s: np.stack([np.full((64, 64, 3), 7, dtype=np.uint8) for _ in timestamps]),
+    )
+    _write_settle_windows(full_root, {0: 5, 1: 4, 2: 6, 3: 3, 4: 8, 5: 7})
+    # the sidecar: one PNG per episode whose pixel value is 100 + the episode index, and its manifest
+    sidecar = full_root / b1k_dataset.GOAL_NOROBOT_DIR
+    (sidecar / "zed_link").mkdir(parents=True)
+    entries = {}
+    for ep in range(6):
+        Image.fromarray(np.full((64, 64, 3), 100 + ep, dtype=np.uint8)).save(sidecar / "zed_link" / f"{ep:06d}.png")
+        entries[str(ep)] = {"zed_link": {"path": f"zed_link/{ep:06d}.png", "state_index": 11, "frames": 12}}
+    (sidecar / "manifest.json").write_text(
+        json.dumps({"format": b1k_dataset.GOAL_NOROBOT_FORMAT, "cameras": ["zed_link"], "episodes": entries})
+    )
+
+    model = config.get_config("pi05_b1k").model
+    model = dataclasses.replace(model, goal_image_keys=("goal_0_rgb",))
+
+    def make(goal_source):
+        dc = config.LeRobotB1KDataConfig(
+            repo_id="org/demos",
+            dataset_root=str(full_root),
+            robot_config_name="b1k/R1Pro",
+            task_names=["turning_on_radio"],
+            settle_steps="0",
+            goal_views=("goal_image_0",),
+            goal_source=goal_source,
+            conditioning_regime="image",
+            base_config=config.DataConfig(prompt_from_task=True),
+        ).create(full_root / "assets", model)
+        return data_loader.create_b1k_dataset(dc, HORIZON, model)
+
+    ds = make("norobot_last")
+    assert len(ds) == 9
+    assert ds.inference_metadata["conditioning"]["goal_source"] == "norobot_last"
+    sample = ds[2]  # a frame of episode 0 (the first five samples): the sidecar image, not the decoded last frame (7)
+    assert int(sample["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 100
+    assert int(ds[7]["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 100 + int(ds[7]["episode_index"])
+    assert int(make("episode_last")[2]["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 7
+    # a missing episode or a wrong image shape is refused
+    (sidecar / "manifest.json").write_text(
+        json.dumps({"format": b1k_dataset.GOAL_NOROBOT_FORMAT, "cameras": ["zed_link"], "episodes": {k: v for k, v in entries.items() if k != "1"}})
+    )
+    with pytest.raises(ValueError, match="no robot-free goal image for episode 1"):
+        make("norobot_last")
+    (sidecar / "manifest.json").write_text(
+        json.dumps({"format": b1k_dataset.GOAL_NOROBOT_FORMAT, "cameras": ["zed_link"], "episodes": entries})
+    )
+    Image.fromarray(np.zeros((32, 64, 3), dtype=np.uint8)).save(sidecar / "zed_link" / "000001.png")  # a selected episode
+    with pytest.raises(ValueError, match="shape"):
+        make("norobot_last")
+    (sidecar / "manifest.json").unlink()
+    with pytest.raises(FileNotFoundError, match="goal_source=norobot_last needs"):
+        make("norobot_last")

@@ -241,14 +241,15 @@ def create_b1k_dataset(
                         "(use --data.goal-source episode_last otherwise)"
                     )
                 resolved_goal_source = "goal_key"
-            elif goal_source == "episode_last":
-                resolved_goal_source = "episode_last"
+            elif goal_source in ("episode_last", "norobot_last"):
+                resolved_goal_source = goal_source
             else:
                 raise ValueError(f"Unknown goal_source {goal_source!r}; expected one of {_b1k_dataset.GOAL_SOURCES}")
-            if resolved_goal_source == "episode_last":
+            if resolved_goal_source in ("episode_last", "norobot_last"):
                 if data_config.data_cls is not _b1k_dataset.B1KLeRobotDataset or not goal_camera_keys:
-                    raise NotImplementedError("goal_source=episode_last requires B1KLeRobotDataset")
+                    raise NotImplementedError(f"goal_source={resolved_goal_source} requires B1KLeRobotDataset")
                 dataset_kwargs["goal_camera_keys"] = goal_camera_keys
+                dataset_kwargs["goal_source"] = resolved_goal_source
                 if "video_keys" in dataset_kwargs and dataset_kwargs["video_keys"] is not None:
                     dataset_kwargs["video_keys"] = [
                         k for k in dataset_kwargs["video_keys"] if k not in set(goal_camera_keys)

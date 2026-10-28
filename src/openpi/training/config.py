@@ -455,8 +455,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # model's goal image slots, which the model config must declare (`--model.goal-image-keys`, one per view, in this
     # order). `goal_source` selects where goal images come from: `episode_last` (the last recorded frame of the
     # episode's own camera stream; works on any LeRobot v3 root, including ISG and the challenge demos), `goal_key`
-    # (the dataset's dedicated `observation.goal_rgb.<camera>_camera_0` stream), or None (auto: `goal_key` if the
-    # dataset ships `observation.goal_rgb.*`, else `episode_last`). `conditioning_regime` fixes the prompt: none / image
+    # (the dataset's dedicated `observation.goal_rgb.<camera>_camera_0` stream), `norobot_last` (the dataset's
+    # `isg_meta/goal_norobot/` sidecar: the last recorded state re-rendered with the robot hidden), or None (auto:
+    # `goal_key` if the dataset ships `observation.goal_rgb.*`, else `episode_last`). `conditioning_regime` fixes the prompt: none / image
     # use the fixed task-independent scaffold only, language / image_language the scaffold plus the task prompt
     # (`prompt_source`). CLI:
     #   --data.goal-views goal_image_0 --data.conditioning-regime image --model.goal-image-keys goal_0_rgb
@@ -592,7 +593,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         for view in goal_views:
             goal_dataset_key = robot_config.goals[view].dataset_key
             repack_mapping[f"observation/{view}"] = goal_dataset_key
-            if self.goal_source != "episode_last":
+            if self.goal_source not in ("episode_last", "norobot_last"):
                 camera_keys.append(goal_dataset_key)
             cam_slot = view.removeprefix("goal_")
             if cam_slot in robot_config.observations:
