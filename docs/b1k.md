@@ -560,3 +560,36 @@ Next steps the plan lists but this branch does not include: the two wrist goal s
 | Out of GPU memory | Reduce `--batch_size` or set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` |
 
 For general fine-tuning concepts (LeRobot conversion, config structure, remote inference), see the [main README](../README.md) and [remote inference docs](./remote_inference.md).
+
+
+## Shared exact relative statistics (data path v2)
+
+`compute_norm_stats.py` now defaults to `--estimator exact` for B1K's fast low-dimensional path. It excludes padded
+chunk steps and includes the final partial batch. Exact quantiles use scratch-backed columns and population moments;
+the shared implementation is identical to ACT/DP's `b1k_data_core.py`. Pi's existing epsilon normalization remains
+unchanged. Keep grippers absolute by omitting `--data.gripper-action delta` in new relative-action recipes.
+
+```bash
+python scripts/compute_norm_stats.py pi05_b1k --estimator exact \
+  --data.repo-id kmy17518/isg-1020-b1k --data.dataset-root "$DATASET" \
+  --data.task-names camera_relocalization object_scaling mental_rotation cm iors_small \
+  --data.settle-steps 0 --data.val-fraction 0.1 --seed 0
+```
+
+Set `B1K_DATASET_REVISION` to the immutable dataset commit before precomputation/training. `stats_manifest.json`
+records portable revision/source-size checks, selection fingerprint, valid counts and estimator metadata beside the
+normal `norm_stats.json`. Old assets without a manifest still load, including checkpoint assets used for serving.
+New local training validates the revision and source sizes; changing mtime or moving an identical dataset is harmless.
+
+`--estimator sampled --sample-size 10000000` samples valid chunk steps deterministically for quantiles while retaining
+exact streaming moments. `auto` chooses this fallback above 500M valid rows; all three models use the same code.
+`--estimator legacy` retains the previous histogram/padding behavior for reproduction. Prefer explicit exact statistics
+when memory/scratch permit them. Full multitask5 (80,258,929 valid steps, horizon 32) took 95 seconds for exact stats
+in the measured CPU environment. The coordination repository's `docs/frame_cache_v2.md` contains scale/resource numbers.
+Pi still reads source videos; the JPEG v2 cache is currently an ACT/DP feature. No source deletion is enabled.
+
+Use `--assets-base-dir /path/to/new-assets` when precomputing the new estimator so legacy assets remain separate;
+point training at that same assets base directory. A two-step real-data Pi05 startup with small text/action experts,
+exact stats, absolute grippers and a complete 101-episode task passed on an A5000 (job 18194668). This is a startup
+check, not a policy-quality experiment. Full-data sampled quantiles had worst error 0.000643 action units (0.187%
+of that dimension's q99-q01); exact remains the default.

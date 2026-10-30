@@ -29,6 +29,7 @@ import dataclasses
 import logging
 import sys
 import time
+from typing import Literal
 
 import numpy as np
 import tqdm
@@ -373,6 +374,11 @@ class Args:
     # (which decodes every camera stream). Same batches, same statistics, orders of magnitude faster; --no-fast uses
     # the regular data loader (also used automatically for datasets the fast path does not support).
     fast: bool = True
+    # Shared ACT/DP/Pi estimator. Legacy retains the old histogram/padding behavior.
+    estimator: Literal['auto', 'exact', 'sampled', 'legacy'] = 'exact'
+    sample_size: int = 10_000_000
+    # Keep a new estimator's assets separate from legacy assets/checkpoints.
+    assets_base_dir: str | None = None
     # Training seed (default: the config's), which selects the validation episodes of --data.val-fraction; pass the
     # same --seed as train_b1k.py.
     seed: int | None = None
@@ -403,10 +409,32 @@ def cli(argv: Sequence[str] | None = None) -> Args:
 
 def main(args: Args):
     config = _config.get_config(args.config_name)
-    config = dataclasses.replace(config, data=args.data, seed=config.seed if args.seed is None else args.seed)
+    config = dataclasses.replace(config, data=args.data, seed=config.seed if args.seed is None else args.seed,
+                                 assets_base_dir=args.assets_base_dir or config.assets_base_dir)
     max_frames = args.max_frames
     data_config = config.data.create(config.assets_dirs, config.model)
     keys = ["state", "actions"]
+
+    if args.estimator != 'legacy' and data_config.dataset_root is not None:
+        if not args.fast:
+            raise ValueError('v2 B1K statistics use the low-dimensional path; --no-fast requires --estimator legacy')
+        from openpi.training import b1k_stats_v2
+        dataset = _create_lowdim_dataset(data_config, config.model.action_horizon)
+        transform = transforms.compose([*data_config.repack_transforms.inputs,
+                                        *data_config.data_transforms.inputs, RemoveStrings()])
+        norm_stats, manifest = b1k_stats_v2.compute(
+            dataset, transform, config.model.action_horizon, estimator=args.estimator,
+            sample_size=args.sample_size, max_frames=args.max_frames, seed=config.seed,
+            representation=data_config.action_representation)
+        output_path = config.assets_dirs / resolve_asset_id(data_config)
+        normalize.save(output_path, norm_stats)
+        import json
+        (output_path / 'stats_manifest.json').write_text(json.dumps(manifest, indent=2))
+        if data_config.action_representation is not None:
+            from openpi.training import b1k_artifacts
+            b1k_artifacts.save_metadata(output_path, b1k_artifacts.norm_metadata(data_config.action_representation))
+        print(f'Wrote padding-excluded shared-estimator statistics to {output_path}')
+        return
 
     start_time = time.monotonic()
     lowdim_batches = None

@@ -507,6 +507,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         norm_stats_metadata = (
             _b1k_artifacts.load_metadata(assets_dir / metadata_asset_id) if metadata_asset_id is not None else None
         )
+        if metadata_asset_id is not None and dataset_root is not None:
+            from openpi.training.b1k_stats_v2 import validate_manifest
+            validate_manifest(dataset_root, assets_dir / metadata_asset_id)
         return dataclasses.replace(
             base_config,
             repo_id=repo_id,
