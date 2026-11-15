@@ -1187,7 +1187,7 @@ class _B1KDatasetReader(DatasetReader):
 
 
 def _referenced_files(
-    meta: LeRobotDatasetMetadata, episode_indices: Sequence[int] | None
+    meta: LeRobotDatasetMetadata, episode_indices: Sequence[int] | None, video_keys: Iterable[str] | None = None
 ) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
     """(data files, video files) referenced by the given episodes (all episodes on disk if ``None``),
     relative to the dataset root, sorted and de-duplicated."""
@@ -1205,7 +1205,10 @@ def _referenced_files(
 
     data_files = files(meta.data_path, "data/chunk_index", "data/file_index")
     video_files: set[pathlib.Path] = set()
+    wanted = None if video_keys is None else set(video_keys)
     for key in meta.video_keys:
+        if wanted is not None and key not in wanted:
+            continue  # a stream this dataset never decodes (e.g. depth) need not be on disk
         video_files |= files(meta.video_path, f"videos/{key}/chunk_index", f"videos/{key}/file_index", video_key=key)
     return sorted(data_files), sorted(video_files)
 
@@ -1350,7 +1353,9 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
                 for idx in range(int(ep["dataset_from_index"]), int(ep["dataset_to_index"]))
             }
 
-        data_files, video_files = _referenced_files(self.meta, self.episodes)
+        # Only the streams this dataset reads: the requested cameras and the goal images' source streams.
+        read_keys = None if video_keys is None else set(video_keys) | set((goal_camera_keys or {}).values())
+        data_files, video_files = _referenced_files(self.meta, self.episodes, read_keys)
         _check_files_exist(self.root, data_files, "data")
         _check_files_exist(self.root, video_files, "video")
 

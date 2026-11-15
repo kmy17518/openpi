@@ -29,6 +29,7 @@
 #   TASK_NAMES  comma-separated tasks / task groups [the groups of isg_meta/task_groups.json: every task]
 #   WANDB_ENTITY [kmy17518]   WANDB_PROJECT [b1k-isg-train224]   WANDB_MODE [online] (needs WANDB_API_KEY)
 #   HF_REPO     [kmy17518/$RUN]   HF_PUBLIC [0]   HF_XET [1]   (needs HF_TOKEN with write access)
+#   UPLOAD      [1]; 0 trains without the exporter / upload monitor (smoke tests)   LOG_INTERVAL [100]
 set -euo pipefail
 OPENPI_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${DATASET:?set DATASET to the LeRobot v3 root}"
@@ -40,6 +41,12 @@ OUT_ROOT=${OUT_ROOT:-/tmp/dev/runs/train224}
 LOG_ROOT=${LOG_ROOT:-$OUT_ROOT/logs}
 export B1K_GOAL_TABLE_DIR=${B1K_GOAL_TABLE_DIR:-$OUT_ROOT/goal_tables}
 PYTHON=${PYTHON:-.venv-jax/bin/python}
+# launch.sh preallocates 95% of each GPU for XLA: on GB300 (288 GB) that leaves NCCL ~14 GB, on an 80 GB H100 ~4 GB, and
+# FSDP's first all-to-all fails with NCCL 'out of memory' (measured on 8 x H100). Leave 12% on GPUs under 100 GB.
+if [[ -z ${XLA_PYTHON_CLIENT_MEM_FRACTION:-} ]]; then
+    mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1)
+    export XLA_PYTHON_CLIENT_MEM_FRACTION=$( ((${mib:-0} > 0 && ${mib:-0} < 100000)) && echo 0.88 || echo 0.95)
+fi
 NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS:-100000}
 SAVE=${SAVE:-5000}
 HF_REPO=${HF_REPO:-kmy17518/$RUN}
@@ -92,8 +99,8 @@ train() {
         || { echo "no norm stats under outputs/assets/pi05_b1k/$REPO_ID: run '$0 prepare' first" >&2; exit 1; }
     local flags=()
     if compgen -G "$CKPT/[0-9]*" > /dev/null; then flags+=(--resume); elif [[ -d $CKPT ]]; then flags+=(--overwrite); fi
-    upload &
-    local uploader=$! rc=0
+    local uploader='' rc=0
+    if [[ ${UPLOAD:-1} == 1 ]]; then upload & uploader=$!; fi
     echo "[$(date -u +%FT%TZ)] $RUN: training (${flags[*]:-fresh start}); exporter + uploader pid $uploader -> $HF_REPO"
     env EXP_NAME="$RUN" BATCH_SIZE=256 NUM_WORKERS=16 NUM_TRAIN_STEPS="$NUM_TRAIN_STEPS" SAVE_INTERVAL="$SAVE" \
         MAX_TO_KEEP=3 GPU="${GPU:-0,1,2,3}" CPUS="${CPUS:-0-$(($(nproc) - 1))}" REPO_ID="$REPO_ID" DATASET_ROOT="$DATASET" \
@@ -102,11 +109,11 @@ train() {
         WANDB_ENTITY="${WANDB_ENTITY:-kmy17518}" WANDB_PROJECT="${WANDB_PROJECT:-b1k-isg-train224}" WANDB_RUN_ID="$RUN" \
         WANDB_DIR="$DIR" WANDB_CONSOLE=off RUN_DIR="$DIR/run" LOG="$LOG_ROOT/$RUN.log" PYTHON="$PYTHON" \
         bash scripts/b1k/launch.sh "${flags[@]}" --fsdp-devices="${FSDP:-4}" "${selection[@]}" "${goal[@]}" \
-        --val_log_interval="$SAVE" --val_batch_size=64 --val_num_batches=16 --log_interval=100 \
+        --val_log_interval="$SAVE" --val_batch_size=64 --val_num_batches=16 --log_interval="${LOG_INTERVAL:-100}" \
         --lr_schedule.decay_steps="$NUM_TRAIN_STEPS" || rc=$?
     if ((rc == 0)); then
         echo "[$(date -u +%FT%TZ)] $RUN: trainer finished; waiting for the last export / upload"
-        wait "$uploader" || true
+        [[ -z $uploader ]] || wait "$uploader" || true
     else
         echo "[$(date -u +%FT%TZ)] $RUN: trainer exited with $rc; exporter / uploader (pid $uploader) keep publishing" \
              "what is queued; '$0 train' resumes all three" >&2

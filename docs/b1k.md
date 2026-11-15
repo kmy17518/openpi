@@ -631,3 +631,29 @@ completed in 50.1 min for ACT, 18.0 min for DP and 36.9 min for Pi with the cont
 above. Every normalization array matched the corresponding raw-scratch exact run
 bit for bit; scratch footprints were 77.6, 17.2 and 28.4 GB respectively. These
 are computation measurements, not timings for loading an unseen future dataset.
+
+## isg-train224 (branch `isg-train224`)
+
+`scripts/b1k/isg_train224.sh` (`prepare`, `train`, `upload`, `all`; `PI_VARIANT=goal|shufgoal|text`) trains on the batched
+replay's native 224 x 224 LeRobot v3 datasets.
+
+- **Grippers** absolute (no `--data.gripper-action delta`): state q1 + q2 in metres, actions the dataset's commands.
+- **Statistics** exact and padding-free (`compute_norm_stats.py --estimator exact`, the estimator ACT / DP share),
+  computed by `prepare` before the run; training only loads them.
+- **`--shuffle-goal-image`**: each training sample's goal image is drawn uniformly among the *training* episodes of
+  its goal group (`isg_meta/goal_groups.json`, `isg-goal-groups/v1`: episode -> goal group id); validation keeps each
+  episode's own goal. No added runtime: the goal table holds every training episode's goal once (an mmap'd `.npy`,
+  `GoalTable`), and a draw is one integer pick from the episode's group array in the loader worker (seeded from the
+  worker's `torch.initial_seed()`).
+- **`--text-only`**: no goal image; the `language` regime with the task's text from `meta/tasks.jsonl`
+  (`{"task_index", "task_name", "task"}`, the challenge demos' own file; `--data.prompt-source task_description`).
+  Prompts are looked up per `task_index` like every prompt; nothing is added per sample.
+- **Goal tables** (`episode_last`, `norobot_last` and the new `goal_png` = `isg_meta/goal_images/episode_<i>.png`) are
+  decoded once into `$B1K_GOAL_TABLE_DIR` (default `~/.cache/openpi/b1k_goal_tables`) and memory-mapped by the run and
+  each spawned worker instead of a pickled per-worker copy (`scripts/b1k/prepare_goal_table.py` builds them ahead).
+- **Native 224 px**: `resize_with_pad` returns uint8 images already at the target size unchanged (it was an exact but
+  ~9 ms identity resize per image per sample on the CPU workers). Only the streams the run decodes need to be on disk
+  (a copy without depth videos loads).
+- **Validation** `--data.val-fraction 0.05` (ACT / DP's episodes), `--lr_schedule.decay_steps` = the run length,
+  `--max_to_keep 3 --keep_period None`, online W&B, and the exporter + `scripts/b1k/upload_checkpoints.py` (ACT's
+  uploader, vendored) beside the trainer: an eval tar per save and one resume tar, the previous one deleted.
