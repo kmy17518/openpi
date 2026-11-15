@@ -149,6 +149,7 @@ def create_b1k_dataset(
     """
     if data_config.dataset_root is None:
         raise ValueError("dataset_root is not set. Pass --data.dataset-root=<local LeRobot root> for B1K datasets.")
+    split_subset = subset  # `subset` is rebound to the TaskSubset below
     if isinstance(data_config.repo_id, list):
         if data_config.task_names:
             raise NotImplementedError("task_names is not supported with a list of repo_ids (MultiLeRobotDataset).")
@@ -220,6 +221,8 @@ def create_b1k_dataset(
 
         goal_views = tuple(getattr(data_config, "goal_views", ()) or ())
         resolved_goal_source: str | None = None
+        if getattr(data_config, "shuffle_goal_image", False) and not goal_views:
+            raise ValueError("--shuffle-goal-image needs goal views (--data.goal-views goal_image_0)")
         if goal_views:
             goal_source = getattr(data_config, "goal_source", None)
             if goal_source is None:
@@ -241,15 +244,19 @@ def create_b1k_dataset(
                         "(use --data.goal-source episode_last otherwise)"
                     )
                 resolved_goal_source = "goal_key"
-            elif goal_source in ("episode_last", "norobot_last"):
+            elif goal_source in _b1k_dataset.TABLE_GOAL_SOURCES:
                 resolved_goal_source = goal_source
             else:
                 raise ValueError(f"Unknown goal_source {goal_source!r}; expected one of {_b1k_dataset.GOAL_SOURCES}")
-            if resolved_goal_source in ("episode_last", "norobot_last"):
+            if resolved_goal_source in _b1k_dataset.TABLE_GOAL_SOURCES:
                 if data_config.data_cls is not _b1k_dataset.B1KLeRobotDataset or not goal_camera_keys:
                     raise NotImplementedError(f"goal_source={resolved_goal_source} requires B1KLeRobotDataset")
                 dataset_kwargs["goal_camera_keys"] = goal_camera_keys
                 dataset_kwargs["goal_source"] = resolved_goal_source
+                # --shuffle-goal-image: training samples draw their goal image among the training episodes of their
+                # goal group; validation keeps every episode's own goal.
+                if getattr(data_config, "shuffle_goal_image", False) and split_subset == "train":
+                    dataset_kwargs["goal_shuffle"] = True
                 if "video_keys" in dataset_kwargs and dataset_kwargs["video_keys"] is not None:
                     dataset_kwargs["video_keys"] = [
                         k for k in dataset_kwargs["video_keys"] if k not in set(goal_camera_keys)

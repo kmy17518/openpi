@@ -142,6 +142,8 @@ class DataConfig:
     goal_views: Sequence[str] = ()
     goal_source: _b1k_dataset.GoalSource | None = None
     conditioning_regime: str | None = None
+    # Training samples show the goal image of a random training episode of their goal group (TrainConfig).
+    shuffle_goal_image: bool = False
 
 
 class GroupFactory(Protocol):
@@ -472,6 +474,24 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # Served gripper commands are clamped to [-1, 1] and set to +1 (open) above this threshold; None serves them
     # unchanged. Applies to inference only (`B1KOutputs`).
     gripper_snap_threshold: float | None = b1k_policy.DEFAULT_GRIPPER_SNAP_THRESHOLD
+    # Set from TrainConfig.shuffle_goal_image / TrainConfig.text_only (CLI --shuffle-goal-image / --text-only).
+    shuffle_goal_image: tyro.conf.Suppress[bool] = False
+    text_only: tyro.conf.Suppress[bool] = False
+
+    def _resolve_text_only(self) -> "LeRobotB1KDataConfig":
+        """--text-only: no goal image; the prompt is the task's text from the dataset's `meta/tasks.jsonl`
+        (conditioning regime `language`: the plain scaffold followed by that text)."""
+        if not self.text_only:
+            return self
+        if self.goal_views or self.goal_source is not None or self.shuffle_goal_image:
+            raise ValueError("--text-only excludes goal images (--data.goal-views / --data.goal-source / "
+                             "--shuffle-goal-image)")
+        if self.conditioning_regime not in (None, "language"):
+            raise ValueError(f"--text-only is the language regime, not {self.conditioning_regime}")
+        if self.prompt_source not in (None, "task_description"):
+            raise ValueError("--text-only prompts with the dataset's task text (--data.prompt-source task_description)")
+        return dataclasses.replace(self, conditioning_regime="language", prompt_source="task_description",
+                                   text_only=False)
 
     @override
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -564,6 +584,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.text_only:
+            return self._resolve_text_only().create(assets_dirs, model_config)
         robot_config = ROBOT_REGISTRY[self.robot_config_name]
 
         # Build repack mapping dynamically based on available observations
@@ -684,6 +706,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             goal_views=goal_views,
             goal_source=self.goal_source,
             conditioning_regime=regime,
+            shuffle_goal_image=self.shuffle_goal_image,
             dataset_kwargs=dataset_kwargs,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
@@ -888,6 +911,11 @@ class TrainConfig:
     # Optionally, repo_id for validation set (if different from train)
     val_repo_id: str | None = None
     val_episodes_index: List[int] | None = None
+    # B1K goal conditioning. --shuffle-goal-image: each training sample's goal image is drawn uniformly among the
+    # training episodes of its goal group (`<dataset_root>/isg_meta/goal_groups.json`; validation keeps each episode's
+    # own goal). --text-only: no goal image; the policy is prompted with the task's text from `meta/tasks.jsonl`.
+    shuffle_goal_image: bool = False
+    text_only: bool = False
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -911,6 +939,13 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
         if isinstance(self.data, LeRobotB1KDataConfig) and self.data.val_seed != self.seed:
             object.__setattr__(self, "data", dataclasses.replace(self.data, val_seed=self.seed))
+        if self.shuffle_goal_image or self.text_only:
+            if not isinstance(self.data, LeRobotB1KDataConfig):
+                raise ValueError("--shuffle-goal-image / --text-only apply to B1K data configs")
+            if self.shuffle_goal_image and self.text_only:
+                raise ValueError("--shuffle-goal-image and --text-only are exclusive (text-only has no goal image)")
+            object.__setattr__(self, "data", dataclasses.replace(
+                self.data, shuffle_goal_image=self.shuffle_goal_image, text_only=self.text_only))
 
 
 # Use `get_config` if you need to get a config by name in your code.

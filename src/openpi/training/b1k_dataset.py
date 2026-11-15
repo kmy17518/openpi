@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import pathlib
 import re
 from typing import Any, Literal, get_args
@@ -73,11 +74,22 @@ TASK_REGISTRY_BUCKET = "b1k"
 #                   `isg_meta/goal_norobot/<camera>/<episode:06d>.png` + manifest.json, format isg-goal-norobot/v1,
 #                   from train85/work/goal_norobot/render_goals.py): the same camera and scene state as episode_last
 #                   without the robot's arms and torso in the view.
-GoalSource = Literal["episode_last", "goal_key", "norobot_last"]
+#   goal_png     -- the dataset's lossless goal image of the head camera, `isg_meta/goal_images/episode_<i:06d>.png`
+#                   (the batched replay's 224 px datasets: the episode's last rendered head frame before video
+#                   compression, the same render as the evaluator's goal image). Head view (goal_image_0) only.
+GoalSource = Literal["episode_last", "goal_key", "norobot_last", "goal_png"]
 GOAL_SOURCES: tuple[str, ...] = get_args(GoalSource)
 DEFAULT_GOAL_SOURCE: GoalSource = "episode_last"
+TABLE_GOAL_SOURCES: tuple[str, ...] = ("episode_last", "norobot_last", "goal_png")  # decoded once into a GoalTable
 GOAL_NOROBOT_DIR = "isg_meta/goal_norobot"
 GOAL_NOROBOT_FORMAT = "isg-goal-norobot/v1"
+GOAL_PNG_DIR = "isg_meta/goal_images"
+GOAL_PNG_CAMERA = "observation.rgb.zed_link_camera_0"
+# Goal groups (--shuffle-goal-image): `isg_meta/goal_groups.json`, format isg-goal-groups/v1,
+# {"episodes": {"<episode_index>": "<goal group id>"}}; episodes of one group share the same goal (the same goal
+# configuration within the admission tolerance), so any of their goal images shows that episode's goal.
+GOAL_GROUPS_FILE = "isg_meta/goal_groups.json"
+GOAL_GROUPS_FORMAT = "isg-goal-groups/v1"
 
 EPISODE_SPLIT_FILE = "isg_meta/train_split.json"
 EPISODE_SPLIT_FORMAT = "isg-episode-split/v1"
@@ -951,6 +963,108 @@ class VideoFrameReader:
         return np.stack([converted[index] for index in closest.tolist()])
 
 
+def goal_table_cache_dir() -> pathlib.Path:
+    """Where decoded goal tables are kept between runs (``$B1K_GOAL_TABLE_DIR``, else ``$OPENPI_DATA_HOME`` /
+    ``~/.cache/openpi`` + ``b1k_goal_tables``)."""
+    if explicit := os.environ.get("B1K_GOAL_TABLE_DIR"):
+        return pathlib.Path(explicit)
+    base = os.environ.get("OPENPI_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "openpi")
+    return pathlib.Path(base) / "b1k_goal_tables"
+
+
+class GoalTable:
+    """Per-episode goal images in one contiguous ``(episodes, views, H, W, 3)`` uint8 array.
+
+    Built once (decoding videos or reading PNGs) and saved as ``.npy`` in :func:`goal_table_cache_dir`, keyed by the
+    dataset revision, source, views and episodes; later constructions -- the next run, and every spawned loader
+    worker -- memory-map the file instead of decoding again or receiving a pickled copy of the frames.
+    """
+
+    def __init__(self, keys: Sequence[str], episode_ids: Sequence[int], path: pathlib.Path | None, frames=None):
+        self.keys = tuple(keys)
+        self.rows = {int(ep): row for row, ep in enumerate(episode_ids)}
+        self.path = path
+        self._frames = frames
+
+    @property
+    def frames(self) -> np.ndarray:
+        if self._frames is None:
+            self._frames = np.load(self.path, mmap_mode="r")
+        return self._frames
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        if self.path is not None:
+            state["_frames"] = None  # workers memory-map the file
+        return state
+
+    def __contains__(self, ep: int) -> bool:
+        return int(ep) in self.rows
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, ep: int) -> dict[str, np.ndarray]:
+        row = self.frames[self.rows[int(ep)]]
+        return {key: np.array(row[i]) for i, key in enumerate(self.keys)}  # a writable copy (150 KB at 224 px)
+
+    @classmethod
+    def build(cls, key: dict[str, Any], keys: Sequence[str], episode_ids: Sequence[int], read_episode) -> "GoalTable":
+        """``read_episode(ep) -> list of (H, W, 3) uint8 frames in ``keys`` order``; cached under ``key``'s digest."""
+        import fcntl
+
+        episode_ids = [int(ep) for ep in episode_ids]
+        digest = hashlib.sha256(json.dumps({**key, "keys": list(keys), "episodes": episode_ids},
+                                           sort_keys=True).encode()).hexdigest()[:32]
+        directory = goal_table_cache_dir()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            directory = None
+        if directory is None or os.environ.get("B1K_GOAL_TABLE_CACHE", "1") == "0":
+            frames = np.stack([np.stack(read_episode(ep)) for ep in episode_ids])
+            return cls(keys, episode_ids, None, frames)
+        path = directory / f"{digest}.npy"
+        with open(directory / f"{digest}.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not path.is_file():
+                first = np.stack(read_episode(episode_ids[0]))
+                tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                out = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.uint8, shape=(len(episode_ids), *first.shape))
+                out[0] = first
+                for row, ep in enumerate(episode_ids[1:], 1):
+                    out[row] = np.stack(read_episode(ep))
+                out.flush()
+                del out
+                os.replace(tmp, path)
+                (directory / f"{digest}.json").write_text(json.dumps({**key, "keys": list(keys),
+                                                                       "episodes": len(episode_ids)}, indent=1))
+                logging.info("Goal table cached at %s", path)
+            else:
+                logging.info("Goal table memory-mapped from %s", path)
+        return cls(keys, episode_ids, path)
+
+
+def load_goal_groups(root: str | pathlib.Path, episode_ids: Iterable[int]) -> dict[int, np.ndarray]:
+    """``episode_index -> episode indices sharing its goal group`` among ``episode_ids`` (itself included), from
+    ``isg_meta/goal_groups.json``. Episodes outside ``episode_ids`` (validation, other tasks) are never drawn."""
+    path = pathlib.Path(root) / GOAL_GROUPS_FILE
+    if not path.is_file():
+        raise FileNotFoundError(f"--shuffle-goal-image needs {path} ({GOAL_GROUPS_FORMAT}: episode -> goal group id)")
+    record = json.loads(path.read_text())
+    if record.get("format") != GOAL_GROUPS_FORMAT:
+        raise ValueError(f"{path}: format {record.get('format')!r}, expected {GOAL_GROUPS_FORMAT}")
+    groups_of = record["episodes"]
+    members: dict[str, list[int]] = collections.defaultdict(list)
+    episode_ids = [int(ep) for ep in episode_ids]
+    for ep in episode_ids:
+        if (group := groups_of.get(str(ep))) is None:
+            raise ValueError(f"{path} has no goal group for episode {ep}")
+        members[group].append(ep)
+    arrays = {group: np.asarray(sorted(eps), dtype=np.int64) for group, eps in members.items()}
+    return {ep: arrays[groups_of[str(ep)]] for ep in episode_ids}
+
+
 class _B1KDatasetReader(DatasetReader):
     """``DatasetReader`` over an explicit list of data files, with lengths and frame-index mapping derived
     from the rows actually loaded instead of the dataset-wide totals in ``meta/info.json``.
@@ -970,13 +1084,16 @@ class _B1KDatasetReader(DatasetReader):
         decoder_threads: int = 1,
         max_open_videos: int = 32,
         kept_indices: set[int] | None = None,
-        goal_table: dict[int, dict[str, np.ndarray]] | None = None,
+        goal_table: "GoalTable | None" = None,
+        goal_groups: dict[int, np.ndarray] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._data_files = [str(path) for path in data_files]
         self._kept_indices = kept_indices
         self._goal_table = goal_table
+        self._goal_groups = goal_groups
+        self._goal_rng: tuple[int, np.random.Generator] | None = None
         available = list(self._meta.video_keys)
         if video_keys is None:
             self._video_keys = available
@@ -1011,10 +1128,24 @@ class _B1KDatasetReader(DatasetReader):
                 result[key] = torch.from_numpy(frames).squeeze(0)  # (H, W, 3) uint8, or (T, H, W, 3) for several
         return result
 
+    def _goal_episode(self, ep_idx: int) -> int:
+        """The episode whose goal image this sample shows: itself, or with goal groups (--shuffle-goal-image) a
+        uniform draw among the training episodes of its goal group (itself included). The generator is seeded from
+        ``torch.initial_seed()``, which the loader sets per worker and epoch from the run's seed."""
+        if self._goal_groups is None:
+            return ep_idx
+        members = self._goal_groups[ep_idx]
+        if len(members) == 1:
+            return ep_idx
+        seed = torch.initial_seed()
+        if self._goal_rng is None or self._goal_rng[0] != seed:
+            self._goal_rng = (seed, np.random.default_rng(seed))
+        return int(members[self._goal_rng[1].integers(len(members))])
+
     def get_item(self, idx) -> dict:
         item = super().get_item(idx)
         if self._goal_table is not None:
-            ep_idx = int(item["episode_index"])
+            ep_idx = self._goal_episode(int(item["episode_index"]))
             for key, frame in self._goal_table[ep_idx].items():
                 item[key] = torch.from_numpy(frame)
         return item
@@ -1135,6 +1266,7 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         settle_steps: str | int | float = "all",
         goal_camera_keys: dict[str, str] | None = None,
         goal_source: GoalSource = DEFAULT_GOAL_SOURCE,
+        goal_shuffle: bool = False,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
         video_backend: str | None = None,
@@ -1222,13 +1354,28 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         _check_files_exist(self.root, data_files, "data")
         _check_files_exist(self.root, video_files, "video")
 
-        goal_table: dict[int, dict[str, np.ndarray]] | None = None
+        goal_table: GoalTable | None = None
+        goal_groups: dict[int, np.ndarray] | None = None
         self.goal_source = goal_source
         if goal_camera_keys:
             if goal_source == "norobot_last":
                 goal_table = self._load_norobot_goal_table(episode_ids, goal_camera_keys)
+            elif goal_source == "goal_png":
+                goal_table = self._load_png_goal_table(episode_ids, goal_camera_keys)
             else:
                 goal_table = self._build_goal_table(episode_ids, goal_camera_keys, tolerance_s)
+        if goal_shuffle:
+            if goal_table is None:
+                raise ValueError(f"goal_shuffle needs goal views with a goal source of {TABLE_GOAL_SOURCES}")
+            goal_groups = load_goal_groups(self.root, episode_ids)
+            sizes = np.asarray([len(members) for members in goal_groups.values()])
+            logging.info(
+                "Goal shuffle: %d episodes in %d goal groups (episodes per group: mean %.2f, max %d; %d episodes "
+                "alone in their group keep their own goal)",
+                len(goal_groups), len({id(m) for m in goal_groups.values()}), sizes.mean(), sizes.max(),
+                int((sizes == 1).sum()),
+            )
+        self.goal_groups = goal_groups
 
         self.reader = _B1KDatasetReader(
             meta=self.meta,
@@ -1246,6 +1393,7 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
             max_open_videos=max_open_videos,
             kept_indices=kept_indices,
             goal_table=goal_table,
+            goal_groups=goal_groups,
         )
         self.reader.load_and_activate()
         logging.info(
@@ -1265,7 +1413,7 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
         episode_ids: Sequence[int],
         goal_camera_keys: dict[str, str],
         tolerance_s: float,
-    ) -> dict[int, dict[str, np.ndarray]]:
+    ) -> "GoalTable":
         """Decode the last recorded frame of each requested camera stream per episode once at construction.
 
         ``goal_camera_keys`` maps ``output_key`` (e.g. ``observation.goal_rgb.zed_link_camera_0``) to the camera's
@@ -1291,30 +1439,61 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
                 raise ValueError(f"Missing last-frame timestamp for episode(s) {missing} in {path}")
 
         reader = VideoFrameReader(max_open_files=16, decoder_threads=1)
-        table_out: dict[int, dict[str, np.ndarray]] = {}
+
+        def read_episode(ep_id: int) -> list[np.ndarray]:
+            ep = self.meta.episodes[ep_id]
+            ts = last_timestamps[int(ep_id)]
+            frames = []
+            for cam_key in goal_camera_keys.values():
+                from_ts = float(ep[f"videos/{cam_key}/from_timestamp"])
+                video_path = self.root / self.meta.get_video_file_path(ep_id, cam_key)
+                frames.append(reader.read(video_path, [from_ts + ts], tolerance_s)[0])
+            return frames
+
         try:
-            for ep_id in episode_ids:
-                ep = self.meta.episodes[ep_id]
-                ts = last_timestamps[int(ep_id)]
-                ep_goals: dict[str, np.ndarray] = {}
-                for out_key, cam_key in goal_camera_keys.items():
-                    from_ts = float(ep[f"videos/{cam_key}/from_timestamp"])
-                    video_path = self.root / self.meta.get_video_file_path(ep_id, cam_key)
-                    frame = reader.read(video_path, [from_ts + ts], tolerance_s)[0]
-                    ep_goals[out_key] = frame
-                table_out[int(ep_id)] = ep_goals
+            videos = [self.root / self.meta.get_video_file_path(ep, cam) for ep in episode_ids
+                      for cam in goal_camera_keys.values()]
+            table = GoalTable.build(self._goal_table_key("episode_last", videos), list(goal_camera_keys), episode_ids,
+                                    read_episode)
         finally:
             reader.close()
-        logging.info(
-            "Goal table (episode_last): %d episodes x %d views decoded",
-            len(table_out),
-            len(goal_camera_keys),
-        )
-        return table_out
+        logging.info("Goal table (episode_last): %d episodes x %d views", len(table), len(goal_camera_keys))
+        return table
+
+    def _goal_table_key(self, source: str, files: Iterable[pathlib.Path]) -> dict[str, Any]:
+        """Cache identity of a goal table: dataset revision, source, and the (size, mtime) of every file read."""
+        from openpi.shared.b1k_data_core import revision
+
+        stats = hashlib.sha256()
+        for path in sorted(set(files)):
+            st = path.stat()
+            stats.update(f"{path.relative_to(self.root)}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+        return {"format": "b1k-goal-table/v1", "root": str(self.root.resolve()), "revision": revision(self.root),
+                "source": source, "files": stats.hexdigest()}
+
+    def _load_png_goal_table(self, episode_ids: Sequence[int], goal_camera_keys: dict[str, str]) -> "GoalTable":
+        """The dataset's lossless head-camera goal images ``isg_meta/goal_images/episode_<i:06d>.png``."""
+        from PIL import Image
+
+        if set(goal_camera_keys.values()) != {GOAL_PNG_CAMERA}:
+            raise ValueError(f"goal_source=goal_png has head-camera goals only ({GOAL_PNG_CAMERA}); got {goal_camera_keys}")
+        expected = tuple(self.meta.features[GOAL_PNG_CAMERA]["shape"])
+
+        def read_episode(ep_id: int) -> list[np.ndarray]:
+            path = self.root / GOAL_PNG_DIR / f"episode_{int(ep_id):06d}.png"
+            frame = np.asarray(Image.open(path).convert("RGB"))
+            if frame.shape != expected:
+                raise ValueError(f"{path}: shape {frame.shape}, the {GOAL_PNG_CAMERA} stream has {expected}")
+            return [frame] * len(goal_camera_keys)
+
+        pngs = [self.root / GOAL_PNG_DIR / f"episode_{int(ep):06d}.png" for ep in episode_ids]
+        table = GoalTable.build(self._goal_table_key("goal_png", pngs), list(goal_camera_keys), episode_ids, read_episode)
+        logging.info("Goal table (goal_png): %d episodes from %s", len(table), self.root / GOAL_PNG_DIR)
+        return table
 
     def _load_norobot_goal_table(
         self, episode_ids: Sequence[int], goal_camera_keys: dict[str, str]
-    ) -> dict[int, dict[str, np.ndarray]]:
+    ) -> "GoalTable":
         """Read each requested camera's robot-free goal image per episode from the dataset's ``isg_meta/goal_norobot``
         sidecar (``manifest.json`` + ``<camera>/<episode:06d>.png``), the same shape as the camera stream's frames.
 
@@ -1351,6 +1530,8 @@ class B1KLeRobotDataset(torch.utils.data.Dataset):
                     raise ValueError(f"{path}: shape {frame.shape}, the {cam_key} stream has {expected}")
                 ep_goals[out_key] = frame
             table_out[int(ep_id)] = ep_goals
+        table_out = GoalTable(list(goal_camera_keys), list(table_out), None,
+                              np.stack([np.stack([goals[k] for k in goal_camera_keys]) for goals in table_out.values()]))
         logging.info(
             "Goal table (norobot_last, %s): %d episodes x %d views read from %s",
             manifest.get("render", {}).get("renderer", "renders of the demos' last states"),

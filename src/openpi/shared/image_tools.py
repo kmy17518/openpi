@@ -19,6 +19,10 @@ def resize_with_pad(
     """Replicates tf.image.resize_with_pad. Resizes an image to a target height and width without distortion
     by padding with black. If the image is float32, it must be in the range [-1, 1].
     """
+    if images.dtype == jnp.uint8 and tuple(images.shape[-3:-1]) == (height, width):
+        # Already the target size (e.g. ISG's native 224 x 224 renders): the resize below is an exact identity for
+        # uint8 (verified bit-for-bit) but costs ~9 ms per 224 x 224 image on a CPU data worker.
+        return images
     has_batch_dim = images.ndim == 4
     if not has_batch_dim:
         images = images[None]  # type: ignore

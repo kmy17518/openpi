@@ -1062,3 +1062,131 @@ def test_norobot_last_goal_source_reads_the_sidecar_images(full_root: pathlib.Pa
     (sidecar / "manifest.json").unlink()
     with pytest.raises(FileNotFoundError, match="goal_source=norobot_last needs"):
         make("norobot_last")
+
+
+@pytest.fixture(autouse=True)
+def _goal_table_cache(tmp_path_factory, monkeypatch):
+    """Goal tables are cached under a per-test directory, never the user's ~/.cache/openpi."""
+    monkeypatch.setenv("B1K_GOAL_TABLE_DIR", str(tmp_path_factory.mktemp("goal_tables")))
+
+
+def _goal_png_root(full_root: pathlib.Path, monkeypatch) -> None:
+    """Head stream + one PNG goal per episode (pixel 100 + episode index) + goal groups {0, 1}, {2}, {3}, {4, 5}."""
+    from PIL import Image
+    from lerobot.datasets import dataset_reader
+
+    rgb = "observation.rgb.zed_link_camera_0"
+    _add_video_streams(full_root, {rgb: False})
+    monkeypatch.setattr(dataset_reader.DepthEncoderConfig, "from_video_info", mock.Mock())
+    for chunk in range(3):
+        path = full_root / "videos" / rgb / f"chunk-{chunk:03d}" / "file-000.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    monkeypatch.setattr(
+        b1k_dataset.VideoFrameReader,
+        "read",
+        lambda self, path, timestamps, tolerance_s: np.stack([np.full((64, 64, 3), 7, dtype=np.uint8) for _ in timestamps]),
+    )
+    goals = full_root / b1k_dataset.GOAL_PNG_DIR
+    goals.mkdir(parents=True)
+    for ep in range(6):
+        Image.fromarray(np.full((64, 64, 3), 100 + ep, dtype=np.uint8)).save(goals / f"episode_{ep:06d}.png")
+    groups = {0: "g01", 1: "g01", 2: "g2", 3: "g3", 4: "g45", 5: "g45"}
+    (full_root / b1k_dataset.GOAL_GROUPS_FILE).write_text(json.dumps(
+        {"format": b1k_dataset.GOAL_GROUPS_FORMAT, "episodes": {str(k): v for k, v in groups.items()}}))
+
+
+def _goal_data_config(full_root, model, **kwargs):
+    from openpi.training import config
+
+    return config.LeRobotB1KDataConfig(
+        repo_id="org/demos",
+        dataset_root=str(full_root),
+        robot_config_name="b1k/R1Pro",
+        settle_steps="all",
+        base_config=config.DataConfig(prompt_from_task=True),
+        **kwargs,
+    ).create(full_root / "assets", model)
+
+
+def test_goal_png_source_and_memory_mapped_goal_table(full_root: pathlib.Path, monkeypatch):
+    from openpi.training import config
+    from openpi.training import data_loader
+
+    _goal_png_root(full_root, monkeypatch)
+    model = dataclasses.replace(config.get_config("pi05_b1k").model, goal_image_keys=("goal_0_rgb",))
+    dc = _goal_data_config(full_root, model, goal_views=("goal_image_0",), goal_source="goal_png",
+                           conditioning_regime="image")
+    ds = data_loader.create_b1k_dataset(dc, HORIZON, model)
+    assert ds.inference_metadata["conditioning"]["goal_source"] == "goal_png"
+    for idx in (0, 13, 40, 71):
+        item = ds[idx]
+        assert int(item["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 100 + int(item["episode_index"])
+    # The table is one cached .npy: a pickled dataset (a spawned loader worker) memory-maps it instead of copying it.
+    cached = list(pathlib.Path(b1k_dataset.goal_table_cache_dir()).glob("*.npy"))
+    assert len(cached) == 1 and np.load(cached[0]).shape == (6, 1, 64, 64, 3)
+    blob = pickle.dumps(ds)
+    assert len(blob) < 6 * 64 * 64 * 3
+    clone = pickle.loads(blob)
+    assert int(clone[40]["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 100 + int(clone[40]["episode_index"])
+    # A second construction reuses the cached table (no PNG is read again).
+    monkeypatch.setattr("PIL.Image.open", mock.Mock(side_effect=AssertionError("PNG read again")))
+    again = data_loader.create_b1k_dataset(dc, HORIZON, model)
+    assert int(again[0]["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 100
+
+
+def test_shuffle_goal_image_draws_within_the_goal_group_of_training_episodes(full_root: pathlib.Path, monkeypatch):
+    from openpi.training import config
+    from openpi.training import data_loader
+
+    _goal_png_root(full_root, monkeypatch)
+    model = dataclasses.replace(config.get_config("pi05_b1k").model, goal_image_keys=("goal_0_rgb",))
+    dc = _goal_data_config(full_root, model, goal_views=("goal_image_0",), goal_source="goal_png",
+                           conditioning_regime="image", shuffle_goal_image=True)
+    assert dc.shuffle_goal_image
+    ds = data_loader.create_b1k_dataset(dc, HORIZON, model)
+    seen = collections.defaultdict(set)
+    for seed in range(40):
+        torch.manual_seed(seed)  # the loader re-seeds torch per worker and epoch
+        for idx in range(0, len(ds), 3):
+            item = ds[idx]
+            seen[int(item["episode_index"])].add(int(item["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) - 100)
+    assert seen == {0: {0, 1}, 1: {0, 1}, 2: {2}, 3: {3}, 4: {4, 5}, 5: {4, 5}}
+    # Validation (subset "val") keeps every episode's own goal, and only training episodes are drawn: with the
+    # validation split holding out one episode per task, each training episode's group is itself alone.
+    val_dc = dataclasses.replace(dc, val_fraction=0.5, val_seed=0)
+    train = data_loader.create_b1k_dataset(val_dc, HORIZON, model)
+    val = data_loader.create_b1k_dataset(val_dc, HORIZON, model, subset="val")
+    for d in (train, val):
+        for idx in range(len(d)):
+            item = d[idx]
+            assert int(item["observation.goal_rgb.zed_link_camera_0"][0, 0, 0]) == 100 + int(item["episode_index"])
+    # Goal groups are required.
+    (full_root / b1k_dataset.GOAL_GROUPS_FILE).unlink()
+    with pytest.raises(FileNotFoundError, match="goal_groups.json"):
+        data_loader.create_b1k_dataset(dc, HORIZON, model)
+
+
+def test_train_config_shuffle_goal_image_and_text_only_flags(full_root: pathlib.Path, monkeypatch):
+    from openpi.training import config
+    from openpi.training import data_loader
+
+    base = config.get_config("pi05_b1k")
+    data = dataclasses.replace(base.data, dataset_root=str(full_root), repo_id="org/demos")
+    shuffled = dataclasses.replace(base, data=data, shuffle_goal_image=True)
+    assert shuffled.data.shuffle_goal_image
+    with pytest.raises(ValueError, match="exclusive"):
+        dataclasses.replace(base, data=data, shuffle_goal_image=True, text_only=True)
+    # --text-only: language regime, prompted with meta/tasks.jsonl; no goal image anywhere.
+    _write_tasks_jsonl(full_root)
+    text = dataclasses.replace(base, data=data, text_only=True)
+    dc = text.data.create(full_root / "assets", text.model)
+    assert dc.conditioning_regime == "language" and dc.prompt_source == "task_description" and not dc.goal_views
+    ds = data_loader.create_b1k_dataset(dc, HORIZON, text.model)
+    item = ds[0]
+    assert item["prompt"] == DESCRIPTIONS["turning_on_radio"]
+    assert not any(key.startswith("observation.goal_rgb") for key in item)
+    goal_model = dataclasses.replace(text.model, goal_image_keys=("goal_0_rgb",))
+    with pytest.raises(ValueError, match="excludes goal images"):
+        dataclasses.replace(text, data=dataclasses.replace(text.data, goal_views=("goal_image_0",)),
+                            model=goal_model).data.create(full_root / "assets", goal_model)
