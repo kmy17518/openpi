@@ -102,7 +102,7 @@ train() {
     local uploader='' rc=0
     if [[ ${UPLOAD:-1} == 1 ]]; then upload & uploader=$!; fi
     echo "[$(date -u +%FT%TZ)] $RUN: training (${flags[*]:-fresh start}); exporter + uploader pid $uploader -> $HF_REPO"
-    env EXP_NAME="$RUN" BATCH_SIZE=256 NUM_WORKERS=16 NUM_TRAIN_STEPS="$NUM_TRAIN_STEPS" SAVE_INTERVAL="$SAVE" \
+    env EXP_NAME="$RUN" BATCH_SIZE="${BATCH_SIZE:-256}" NUM_WORKERS="${NUM_WORKERS:-16}" NUM_TRAIN_STEPS="$NUM_TRAIN_STEPS" SAVE_INTERVAL="$SAVE" \
         MAX_TO_KEEP=3 GPU="${GPU:-0,1,2,3}" CPUS="${CPUS:-0-$(($(nproc) - 1))}" REPO_ID="$REPO_ID" DATASET_ROOT="$DATASET" \
         TASK_NAMES="$TASK_NAMES" PROMPT_SOURCE=$([[ $PI_VARIANT == text ]] && echo task_description || echo task_name) \
         OPENPI_REMAT_POLICY=nothing_saveable OPENPI_ATTENTION=cudnn WANDB_MODE="${WANDB_MODE:-online}" \
