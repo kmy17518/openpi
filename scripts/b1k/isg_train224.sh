@@ -44,7 +44,7 @@ PYTHON=${PYTHON:-.venv-jax/bin/python}
 # launch.sh preallocates 95% of each GPU for XLA: on GB300 (288 GB) that leaves NCCL ~14 GB, on an 80 GB H100 ~4 GB, and
 # FSDP's first all-to-all fails with NCCL 'out of memory' (measured on 8 x H100). Leave 12% on GPUs under 100 GB.
 if [[ -z ${XLA_PYTHON_CLIENT_MEM_FRACTION:-} ]]; then
-    mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1)
+    mib=$( (nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null || true) | awk "NR == 1")
     export XLA_PYTHON_CLIENT_MEM_FRACTION=$( ((${mib:-0} > 0 && ${mib:-0} < 100000)) && echo 0.88 || echo 0.95)
 fi
 NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS:-100000}
