@@ -217,3 +217,25 @@ def test_invalid_metadata_is_not_treated_as_legacy(tmp_path, metadata):
     (tmp_path / b1k_artifacts.METADATA_FILENAME).write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="metadata|representation"):
         b1k_artifacts.load_metadata(tmp_path)
+
+
+def test_action_quantile_range_floor_widens_only_narrow_action_dims(tmp_path):
+    from openpi.shared import normalize
+
+    q01 = np.array([-0.5, -5e-5, 0.0], np.float32)
+    q99 = np.array([0.5, 5e-5, 0.004], np.float32)
+    stats = {
+        "actions": normalize.NormStats(mean=np.zeros(3), std=np.ones(3), q01=q01, q99=q99),
+        "state": normalize.NormStats(mean=np.zeros(3), std=np.ones(3), q01=q01, q99=q99),
+    }
+    normalize.save(tmp_path / "org/demos", stats)
+    b1k_artifacts.save_metadata(
+        tmp_path / "org/demos", b1k_artifacts.norm_metadata(factory().create(tmp_path, model_config()).action_representation)
+    )
+    plain = factory().create(tmp_path, model_config()).norm_stats
+    np.testing.assert_array_equal(plain["actions"].q01, q01)
+    floored = factory(action_min_quantile_range=0.01).create(tmp_path, model_config()).norm_stats
+    np.testing.assert_allclose(floored["actions"].q01, [-0.5, -0.005, -0.003], atol=1e-7)
+    np.testing.assert_allclose(floored["actions"].q99, [0.5, 0.005, 0.007], atol=1e-7)
+    np.testing.assert_array_equal(floored["state"].q01, q01)  # state untouched
+    np.testing.assert_array_equal(normalize.load(tmp_path / "org/demos")["actions"].q01, q01)  # file untouched

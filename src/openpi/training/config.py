@@ -10,6 +10,7 @@ from typing import Any, List, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -253,6 +254,30 @@ class DataConfigFactory(abc.ABC):
         return None
 
 
+def floor_action_quantile_range(
+    norm_stats: dict[str, _transforms.NormStats] | None, min_range: float | None
+) -> dict[str, _transforms.NormStats] | None:
+    """Widen each action dim whose q99 - q01 is below `min_range` to that range about its midpoint (see
+    LeRobotB1KDataConfig.action_min_quantile_range)."""
+    if not min_range or norm_stats is None or "actions" not in norm_stats:
+        return norm_stats
+    stats = norm_stats["actions"]
+    if stats.q01 is None or stats.q99 is None:
+        return norm_stats
+    q01, q99 = np.asarray(stats.q01, dtype=np.float64), np.asarray(stats.q99, dtype=np.float64)
+    narrow = q99 - q01 < min_range
+    if not narrow.any():
+        return norm_stats
+    mid = (q01 + q99) / 2
+    new_q01 = np.where(narrow, mid - min_range / 2, q01).astype(np.asarray(stats.q01).dtype)
+    new_q99 = np.where(narrow, mid + min_range / 2, q99).astype(np.asarray(stats.q99).dtype)
+    logging.info(
+        "Action quantile range floored to %g on dims %s (ranges %s)",
+        min_range, np.flatnonzero(narrow).tolist(), (q99 - q01)[narrow].tolist(),
+    )
+    return {**norm_stats, "actions": dataclasses.replace(stats, q01=new_q01, q99=new_q99)}
+
+
 @dataclasses.dataclass(frozen=True)
 class FakeDataConfig(DataConfigFactory):
     repo_id: str = "fake"
@@ -474,6 +499,13 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # Served gripper commands are clamped to [-1, 1] and set to +1 (open) above this threshold; None serves them
     # unchanged. Applies to inference only (`B1KOutputs`).
     gripper_snap_threshold: float | None = b1k_policy.DEFAULT_GRIPPER_SNAP_THRESHOLD
+    # Minimum q99 - q01 range of each action dim under quantile normalization (None: the statistics as computed). A
+    # dim that barely moves in the data (R1Pro torso joint 4, action dim 6: range 1e-4 on isg-train-224-v2) otherwise
+    # turns rare small tracking errors into normalized targets of several hundred (the normalization does not clip),
+    # which spike the loss. Narrower dims are widened about their midpoint to this range. Applied to the loaded
+    # statistics, so the checkpoint assets (what serving normalizes with) carry the widened ones; the statistics file is
+    # unchanged. Resuming needs the setting the run started with. CLI: --data.action-min-quantile-range 0.01
+    action_min_quantile_range: float | None = None
     # Set from TrainConfig.shuffle_goal_image / TrainConfig.text_only (CLI --shuffle-goal-image / --text-only).
     shuffle_goal_image: tyro.conf.Suppress[bool] = False
     text_only: tyro.conf.Suppress[bool] = False
@@ -541,7 +573,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             val_fraction=val_fraction,
             val_seed=val_seed,
             prompt_source=prompt_source,
-            norm_stats=self._load_norm_stats(assets_dir, asset_id),
+            norm_stats=floor_action_quantile_range(
+                self._load_norm_stats(assets_dir, asset_id), self.action_min_quantile_range
+            ),
             norm_stats_metadata=norm_stats_metadata,
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )

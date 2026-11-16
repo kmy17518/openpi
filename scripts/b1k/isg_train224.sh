@@ -30,6 +30,8 @@
 #   WANDB_ENTITY [kmy17518]   WANDB_PROJECT [b1k-isg-train224]   WANDB_MODE [online] (needs WANDB_API_KEY)
 #   HF_REPO     [kmy17518/$RUN]   HF_PUBLIC [0]   HF_XET [1]   (needs HF_TOKEN with write access)
 #   UPLOAD      [1]; 0 trains without the exporter / upload monitor (smoke tests)   LOG_INTERVAL [100]
+#   ACTION_MIN_RANGE [0.01] minimum q01..q99 range per action dim (--data.action-min-quantile-range; 0 = off, which
+#               runs started before it existed need to resume)
 set -euo pipefail
 OPENPI_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${DATASET:?set DATASET to the LeRobot v3 root}"
@@ -99,6 +101,8 @@ train() {
         || { echo "no norm stats under outputs/assets/pi05_b1k/$REPO_ID: run '$0 prepare' first" >&2; exit 1; }
     local flags=()
     if compgen -G "$CKPT/[0-9]*" > /dev/null; then flags+=(--resume); elif [[ -d $CKPT ]]; then flags+=(--overwrite); fi
+    local norm=()
+    [[ ${ACTION_MIN_RANGE:-0.01} == 0 ]] || norm=(--data.action-min-quantile-range="${ACTION_MIN_RANGE:-0.01}")
     local uploader='' rc=0
     if [[ ${UPLOAD:-1} == 1 ]]; then upload & uploader=$!; fi
     echo "[$(date -u +%FT%TZ)] $RUN: training (${flags[*]:-fresh start}); exporter + uploader pid $uploader -> $HF_REPO"
@@ -108,7 +112,7 @@ train() {
         OPENPI_REMAT_POLICY=nothing_saveable OPENPI_ATTENTION=cudnn WANDB_MODE="${WANDB_MODE:-online}" \
         WANDB_ENTITY="${WANDB_ENTITY:-kmy17518}" WANDB_PROJECT="${WANDB_PROJECT:-b1k-isg-train224}" WANDB_RUN_ID="$RUN" \
         WANDB_DIR="$DIR" WANDB_CONSOLE=off RUN_DIR="$DIR/run" LOG="$LOG_ROOT/$RUN.log" PYTHON="$PYTHON" \
-        bash scripts/b1k/launch.sh "${flags[@]}" --fsdp-devices="${FSDP:-4}" "${selection[@]}" "${goal[@]}" \
+        bash scripts/b1k/launch.sh "${flags[@]}" "${norm[@]}" --fsdp-devices="${FSDP:-4}" "${selection[@]}" "${goal[@]}" \
         --val_log_interval="$SAVE" --val_batch_size=64 --val_num_batches=16 --log_interval="${LOG_INTERVAL:-100}" \
         --lr_schedule.decay_steps="$NUM_TRAIN_STEPS" || rc=$?
     if ((rc == 0)); then
