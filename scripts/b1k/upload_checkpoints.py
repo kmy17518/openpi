@@ -134,19 +134,32 @@ def make_api(http_timeout=120, xet=False):
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
     os.environ['HF_HUB_DISABLE_XET'] = '0' if xet else '1'
     os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
-    import requests
-    from huggingface_hub import HfApi, configure_http_backend, constants
+    import huggingface_hub
+    from huggingface_hub import HfApi, constants
 
     constants.HF_HUB_DISABLE_XET = not xet
     constants.HF_HUB_ENABLE_HF_TRANSFER = False
 
-    class BoundedSession(requests.Session):
-        def request(self, method, url, **kwargs):
-            if kwargs.get('timeout') is None:
-                kwargs['timeout'] = (10, http_timeout)
-            return super().request(method, url, **kwargs)
+    if hasattr(huggingface_hub, 'configure_http_backend'):  # huggingface_hub < 1.0: requests
+        import requests
 
-    configure_http_backend(backend_factory=BoundedSession)
+        class BoundedSession(requests.Session):
+            def request(self, method, url, **kwargs):
+                if kwargs.get('timeout') is None:
+                    kwargs['timeout'] = (10, http_timeout)
+                return super().request(method, url, **kwargs)
+
+        huggingface_hub.configure_http_backend(backend_factory=BoundedSession)
+    else:  # huggingface_hub >= 1.0 (openpi's .venv-jax): httpx; its default client has no timeout at all
+        import httpx
+        from huggingface_hub.utils import _http
+
+        def bounded_client():
+            client = _http.default_client_factory()
+            client.timeout = httpx.Timeout(http_timeout, connect=10)
+            return client
+
+        huggingface_hub.set_client_factory(bounded_client)
     configure_safe_logging()
     return HfApi(token=os.environ.get('HF_TOKEN'))
 
