@@ -254,28 +254,41 @@ class DataConfigFactory(abc.ABC):
         return None
 
 
-def floor_action_quantile_range(
-    norm_stats: dict[str, _transforms.NormStats] | None, min_range: float | None
+def floor_action_norm_stats(
+    norm_stats: dict[str, _transforms.NormStats] | None,
+    min_std: float | None = None,
+    min_quantile_range: float | None = None,
 ) -> dict[str, _transforms.NormStats] | None:
-    """Widen each action dim whose q99 - q01 is below `min_range` to that range about its midpoint (see
-    LeRobotB1KDataConfig.action_min_quantile_range)."""
-    if not min_range or norm_stats is None or "actions" not in norm_stats:
+    """Floor the spread of each action dim's statistics: std below `min_std` is raised to it (what z-score
+    normalization divides by), and q99 - q01 below `min_quantile_range` is widened to it about its midpoint (what
+    quantile normalization divides by). See LeRobotB1KDataConfig.action_min_std."""
+    if (not min_std and not min_quantile_range) or norm_stats is None or "actions" not in norm_stats:
         return norm_stats
     stats = norm_stats["actions"]
-    if stats.q01 is None or stats.q99 is None:
+    changes = {}
+    if min_std:
+        std = np.asarray(stats.std, dtype=np.float64)
+        low = std < min_std
+        if low.any():
+            changes["std"] = np.where(low, min_std, std).astype(np.asarray(stats.std).dtype)
+            logging.info(
+                "Action std floored to %g on dims %s (std %s)",
+                min_std, np.flatnonzero(low).tolist(), std[low].tolist(),
+            )
+    if min_quantile_range and stats.q01 is not None and stats.q99 is not None:
+        q01, q99 = np.asarray(stats.q01, dtype=np.float64), np.asarray(stats.q99, dtype=np.float64)
+        narrow = q99 - q01 < min_quantile_range
+        if narrow.any():
+            mid = (q01 + q99) / 2
+            changes["q01"] = np.where(narrow, mid - min_quantile_range / 2, q01).astype(np.asarray(stats.q01).dtype)
+            changes["q99"] = np.where(narrow, mid + min_quantile_range / 2, q99).astype(np.asarray(stats.q99).dtype)
+            logging.info(
+                "Action quantile range floored to %g on dims %s (ranges %s)",
+                min_quantile_range, np.flatnonzero(narrow).tolist(), (q99 - q01)[narrow].tolist(),
+            )
+    if not changes:
         return norm_stats
-    q01, q99 = np.asarray(stats.q01, dtype=np.float64), np.asarray(stats.q99, dtype=np.float64)
-    narrow = q99 - q01 < min_range
-    if not narrow.any():
-        return norm_stats
-    mid = (q01 + q99) / 2
-    new_q01 = np.where(narrow, mid - min_range / 2, q01).astype(np.asarray(stats.q01).dtype)
-    new_q99 = np.where(narrow, mid + min_range / 2, q99).astype(np.asarray(stats.q99).dtype)
-    logging.info(
-        "Action quantile range floored to %g on dims %s (ranges %s)",
-        min_range, np.flatnonzero(narrow).tolist(), (q99 - q01)[narrow].tolist(),
-    )
-    return {**norm_stats, "actions": dataclasses.replace(stats, q01=new_q01, q99=new_q99)}
+    return {**norm_stats, "actions": dataclasses.replace(stats, **changes)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -499,12 +512,17 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # Served gripper commands are clamped to [-1, 1] and set to +1 (open) above this threshold; None serves them
     # unchanged. Applies to inference only (`B1KOutputs`).
     gripper_snap_threshold: float | None = b1k_policy.DEFAULT_GRIPPER_SNAP_THRESHOLD
-    # Minimum q99 - q01 range of each action dim under quantile normalization (None: the statistics as computed). A
-    # dim that barely moves in the data (R1Pro torso joint 4, action dim 6: range 1e-4 on isg-train-224-v2) otherwise
-    # turns rare small tracking errors into normalized targets of several hundred (the normalization does not clip),
-    # which spike the loss. Narrower dims are widened about their midpoint to this range. Applied to the loaded
-    # statistics, so the checkpoint assets (what serving normalizes with) carry the widened ones; the statistics file is
-    # unchanged. Resuming needs the setting the run started with. CLI: --data.action-min-quantile-range 0.01
+    # Minimum std of each action dim (None: the statistics as computed). This config trains with z-score (mean/std)
+    # normalization: `create` sets use_quantile_norm=False for every model type, pi05 included. A dim that barely moves
+    # in the data (R1Pro torso joint 4, action dim 6: std 4.5e-5 on isg-train-224-v2) otherwise turns rare small
+    # tracking errors into normalized targets of several hundred (the normalization does not clip), which spike the
+    # loss. Lower stds are raised to this value. Applied to the loaded statistics, so the checkpoint assets (what serving
+    # normalizes with) carry the floored ones; the statistics file is unchanged. Resuming needs the setting the run
+    # started with. CLI: --data.action-min-std 0.005
+    action_min_std: float | None = None
+    # The same floor for quantile normalization (minimum q99 - q01 range, widened about the midpoint). It has no effect
+    # on training here, since this config normalizes with mean/std; it only changes the q01/q99 the checkpoint stores.
+    # CLI: --data.action-min-quantile-range 0.01
     action_min_quantile_range: float | None = None
     # Set from TrainConfig.shuffle_goal_image / TrainConfig.text_only (CLI --shuffle-goal-image / --text-only).
     shuffle_goal_image: tyro.conf.Suppress[bool] = False
@@ -573,8 +591,10 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             val_fraction=val_fraction,
             val_seed=val_seed,
             prompt_source=prompt_source,
-            norm_stats=floor_action_quantile_range(
-                self._load_norm_stats(assets_dir, asset_id), self.action_min_quantile_range
+            norm_stats=floor_action_norm_stats(
+                self._load_norm_stats(assets_dir, asset_id),
+                min_std=self.action_min_std,
+                min_quantile_range=self.action_min_quantile_range,
             ),
             norm_stats_metadata=norm_stats_metadata,
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -746,6 +766,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=(robot_config.action_key,),
+            # z-score (mean/std) normalization for every model type, overriding create_base_config's quantile choice
+            # for pi05 (as upstream B1K does); see action_min_std.
             use_quantile_norm=False,
         )
 

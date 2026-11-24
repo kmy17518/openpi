@@ -30,8 +30,10 @@
 #   WANDB_ENTITY [kmy17518]   WANDB_PROJECT [b1k-isg-train224]   WANDB_MODE [online] (needs WANDB_API_KEY)
 #   HF_REPO     [kmy17518/$RUN]   HF_PUBLIC [0]   HF_XET [1]   (needs HF_TOKEN with write access)
 #   UPLOAD      [1]; 0 trains without the exporter / upload monitor (smoke tests)   LOG_INTERVAL [100]
-#   ACTION_MIN_RANGE [0.01] minimum q01..q99 range per action dim (--data.action-min-quantile-range; 0 = off, which
-#               runs started before it existed need to resume)
+#   ACTION_MIN_STD [0.005] minimum std per action dim (--data.action-min-std; 0 = off). pi05_b1k normalizes with
+#               mean/std, and action dim 6 (torso joint 4) has std 4.5e-5. Runs started without it resume with 0.
+#   ACTION_MIN_RANGE [0] minimum q01..q99 range per action dim (--data.action-min-quantile-range). No effect on
+#               training (mean/std normalization); it only changes the stored q01/q99, so resume with the start value
 set -euo pipefail
 OPENPI_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${DATASET:?set DATASET to the LeRobot v3 root}"
@@ -102,7 +104,8 @@ train() {
     local flags=()
     if compgen -G "$CKPT/[0-9]*" > /dev/null; then flags+=(--resume); elif [[ -d $CKPT ]]; then flags+=(--overwrite); fi
     local norm=()
-    [[ ${ACTION_MIN_RANGE:-0.01} == 0 ]] || norm=(--data.action-min-quantile-range="${ACTION_MIN_RANGE:-0.01}")
+    [[ ${ACTION_MIN_STD:-0.005} == 0 ]] || norm+=(--data.action-min-std="${ACTION_MIN_STD:-0.005}")
+    [[ ${ACTION_MIN_RANGE:-0} == 0 ]] || norm+=(--data.action-min-quantile-range="$ACTION_MIN_RANGE")
     local uploader='' rc=0
     if [[ ${UPLOAD:-1} == 1 ]]; then upload & uploader=$!; fi
     echo "[$(date -u +%FT%TZ)] $RUN: training (${flags[*]:-fresh start}); exporter + uploader pid $uploader -> $HF_REPO"

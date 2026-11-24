@@ -219,6 +219,42 @@ def test_invalid_metadata_is_not_treated_as_legacy(tmp_path, metadata):
         b1k_artifacts.load_metadata(tmp_path)
 
 
+def test_action_norm_floor_raises_only_low_spread_action_dims(tmp_path):
+    from openpi import transforms
+    from openpi.shared import normalize
+
+    std = np.array([0.1, 4.5e-5, 0.003], np.float32)
+    q01 = np.array([-0.5, -5e-5, 0.0], np.float32)
+    q99 = np.array([0.5, 5e-5, 0.004], np.float32)
+    stats = {
+        "actions": normalize.NormStats(mean=np.zeros(3), std=std, q01=q01, q99=q99),
+        "state": normalize.NormStats(mean=np.zeros(3), std=std, q01=q01, q99=q99),
+    }
+    normalize.save(tmp_path / "org/demos", stats)
+    b1k_artifacts.save_metadata(
+        tmp_path / "org/demos", b1k_artifacts.norm_metadata(factory().create(tmp_path, model_config()).action_representation)
+    )
+    plain = factory().create(tmp_path, model_config())
+    # this config normalizes with mean/std (pi05 included), so std is what the floor has to change
+    assert plain.use_quantile_norm is False
+    np.testing.assert_array_equal(plain.norm_stats["actions"].std, std)
+    floored_dc = factory(action_min_std=0.005).create(tmp_path, model_config())
+    floored = floored_dc.norm_stats
+    np.testing.assert_allclose(floored["actions"].std, [0.1, 0.005, 0.005], rtol=1e-6)
+    np.testing.assert_array_equal(floored["actions"].q01, q01)  # quantiles untouched without their floor
+    np.testing.assert_array_equal(floored["state"].std, std)  # state untouched
+    np.testing.assert_array_equal(normalize.load(tmp_path / "org/demos")["actions"].std, std)  # file untouched
+    # a 0.02 deviation on the near-constant dim normalizes to 4 instead of ~444
+    out = transforms.Normalize(floored, use_quantiles=floored_dc.use_quantile_norm)(
+        {"actions": np.array([0.0, 0.02, 0.0], np.float32)}
+    )
+    np.testing.assert_allclose(out["actions"][1], 4.0, rtol=1e-3)
+    both = factory(action_min_std=0.005, action_min_quantile_range=0.01).create(tmp_path, model_config()).norm_stats
+    np.testing.assert_allclose(both["actions"].std, [0.1, 0.005, 0.005], rtol=1e-6)
+    np.testing.assert_allclose(both["actions"].q01, [-0.5, -0.005, -0.003], atol=1e-7)
+    np.testing.assert_allclose(both["actions"].q99, [0.5, 0.005, 0.007], atol=1e-7)
+
+
 def test_action_quantile_range_floor_widens_only_narrow_action_dims(tmp_path):
     from openpi.shared import normalize
 
