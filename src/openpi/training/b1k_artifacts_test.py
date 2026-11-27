@@ -219,6 +219,51 @@ def test_invalid_metadata_is_not_treated_as_legacy(tmp_path, metadata):
         b1k_artifacts.load_metadata(tmp_path)
 
 
+def test_quantile_norm_switch_is_recorded_and_guarded_on_resume(tmp_path):
+    plain = factory().create(tmp_path, model_config())
+    quantile = factory(quantile_norm=True).create(tmp_path, model_config())
+    assert plain.use_quantile_norm is False and quantile.use_quantile_norm is True
+    meta_plain = b1k_artifacts.inference_metadata(plain, model_config(), {"x": "p"})
+    meta_quantile = b1k_artifacts.inference_metadata(quantile, model_config(), {"x": "p"})
+    assert meta_plain["normalization"] == "mean_std" and meta_quantile["normalization"] == "quantile"
+    legacy = {k: v for k, v in meta_plain.items() if k != "normalization"}
+    assert b1k_artifacts.uses_quantile_norm(legacy) is False  # checkpoints before the record: mean/std
+    with pytest.raises(ValueError, match="Unknown normalization"):
+        b1k_artifacts.uses_quantile_norm({"normalization": "minmax"})
+    manager = SimpleNamespace(directory=epath.Path(tmp_path), latest_step=lambda: 10)
+    path = tmp_path / "10/assets" / quantile.asset_id
+    dc = dataclasses.replace(quantile, inference_metadata=meta_quantile)
+    for saved in (meta_plain, legacy):  # a mean/std checkpoint cannot be resumed with quantile normalization
+        b1k_artifacts.save_metadata(path, saved)
+        with pytest.raises(ValueError, match="normalization \\(mean_std\\) differs"):
+            checkpoints.restore_state(manager, object(), SimpleNamespace(data_config=lambda: dc))
+
+
+def test_serving_normalizes_like_the_checkpoint(tmp_path, monkeypatch):
+    from openpi import transforms
+    from openpi.models import pi0_config
+    from openpi.policies import policy_config
+    from openpi.shared import normalize
+
+    checkpoint = tmp_path / "checkpoint"
+    (checkpoint / "params").mkdir(parents=True)
+    stats = {"state": transforms.NormStats(mean=np.zeros(23), std=np.ones(23), q01=-np.ones(23), q99=np.ones(23))}
+    monkeypatch.setattr(policy_config._model, "restore_params", lambda *a, **k: {})
+    monkeypatch.setattr(pi0_config.Pi0Config, "load", lambda self, params: object())
+    monkeypatch.setattr(policy_config._policy, "Policy", lambda model, transforms, **kwargs: transforms)
+    train = config.get_config("pi05_b1k")
+    train = dataclasses.replace(train, data=factory())  # the serving config does not ask for quantiles
+    for name, expected in (("quantile", True), ("mean_std", False), (None, False)):
+        dc = factory(quantile_norm=expected).create(tmp_path / "src", model_config())
+        metadata = b1k_artifacts.inference_metadata(dc, model_config(), {"x": "p"})
+        if name is None:
+            metadata.pop("normalization")
+        assert metadata.get("normalization") == name
+        built = policy_config.create_trained_policy(train, checkpoint, norm_stats=stats, b1k_metadata=metadata)
+        norm = [t for t in built if isinstance(t, transforms.Normalize)]
+        assert len(norm) == 1 and norm[0].use_quantiles is expected
+
+
 def test_action_norm_floor_raises_only_low_spread_action_dims(tmp_path):
     from openpi import transforms
     from openpi.shared import normalize

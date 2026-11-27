@@ -512,17 +512,21 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     # Served gripper commands are clamped to [-1, 1] and set to +1 (open) above this threshold; None serves them
     # unchanged. Applies to inference only (`B1KOutputs`).
     gripper_snap_threshold: float | None = b1k_policy.DEFAULT_GRIPPER_SNAP_THRESHOLD
-    # Minimum std of each action dim (None: the statistics as computed). This config trains with z-score (mean/std)
-    # normalization: `create` sets use_quantile_norm=False for every model type, pi05 included. A dim that barely moves
+    # Normalize states and actions with quantiles (q01..q99 -> [-1, 1]) instead of mean/std. Default off: mean/std, as
+    # upstream B1K and every run before this flag. pi05 feeds the normalized state as tokens binned over [-1, 1] (values
+    # outside land in the edge bins), which quantile normalization fits. Recorded in the checkpoint metadata
+    # ("normalization"); serving follows the checkpoint, and resuming refuses a change. CLI: --data.quantile-norm
+    quantile_norm: bool = False
+    # Minimum std of each action dim (None: the statistics as computed), for mean/std normalization. A dim that barely moves
     # in the data (R1Pro torso joint 4, action dim 6: std 4.5e-5 on isg-train-224-v2) otherwise turns rare small
     # tracking errors into normalized targets of several hundred (the normalization does not clip), which spike the
     # loss. Lower stds are raised to this value. Applied to the loaded statistics, so the checkpoint assets (what serving
     # normalizes with) carry the floored ones; the statistics file is unchanged. Resuming needs the setting the run
     # started with. CLI: --data.action-min-std 0.005
     action_min_std: float | None = None
-    # The same floor for quantile normalization (minimum q99 - q01 range, widened about the midpoint). It has no effect
-    # on training here, since this config normalizes with mean/std; it only changes the q01/q99 the checkpoint stores.
-    # CLI: --data.action-min-quantile-range 0.01
+    # The same floor for quantile normalization (--data.quantile-norm): minimum q99 - q01 range of each action dim,
+    # narrower dims widened about their midpoint (dim 6 range 1e-4 on isg-train-224-v2). Without quantile
+    # normalization it only changes the q01/q99 the checkpoint stores. CLI: --data.action-min-quantile-range 0.01
     action_min_quantile_range: float | None = None
     # Set from TrainConfig.shuffle_goal_image / TrainConfig.text_only (CLI --shuffle-goal-image / --text-only).
     shuffle_goal_image: tyro.conf.Suppress[bool] = False
@@ -766,9 +770,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=(robot_config.action_key,),
-            # z-score (mean/std) normalization for every model type, overriding create_base_config's quantile choice
-            # for pi05 (as upstream B1K does); see action_min_std.
-            use_quantile_norm=False,
+            # mean/std unless --data.quantile-norm (overrides create_base_config's per-model-type choice); see quantile_norm.
+            use_quantile_norm=self.quantile_norm,
         )
 
 

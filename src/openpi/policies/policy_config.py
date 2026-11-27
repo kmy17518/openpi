@@ -74,6 +74,10 @@ def create_trained_policy(
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    if isinstance(train_config.data, _config.LeRobotB1KDataConfig) and b1k_metadata is not None:
+        # The checkpoint records how it was normalized (no record: mean/std, the only B1K choice before it existed).
+        data_config = dataclasses.replace(data_config, use_quantile_norm=b1k_artifacts.uses_quantile_norm(b1k_metadata))
+        logging.info("Normalization from the checkpoint: %s", b1k_artifacts.normalization_name(data_config.use_quantile_norm))
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.

@@ -125,6 +125,12 @@ def restore_state(
             for key in ("conditioning", "episode_split", "settle_steps"):
                 if key in metadata and metadata.get(key) != data_config.inference_metadata.get(key):
                     raise ValueError(f"Resume checkpoint {key} differs from the current training configuration")
+        if metadata is not None and _b1k_artifacts.uses_quantile_norm(metadata) != data_config.use_quantile_norm:
+            raise ValueError(
+                f"Resume checkpoint normalization ({_b1k_artifacts.normalization_name(not data_config.use_quantile_norm)}) "
+                f"differs from the current training configuration "
+                f"({_b1k_artifacts.normalization_name(data_config.use_quantile_norm)}); set --data.quantile-norm to match"
+            )
         _b1k_artifacts.validate_norm_stats(_normalize.load(assets_dir), data_config.norm_stats)
 
     with at.disable_typechecking():

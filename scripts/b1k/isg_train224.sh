@@ -30,10 +30,12 @@
 #   WANDB_ENTITY [kmy17518]   WANDB_PROJECT [b1k-isg-train224]   WANDB_MODE [online] (needs WANDB_API_KEY)
 #   HF_REPO     [kmy17518/$RUN]   HF_PUBLIC [0]   HF_XET [1]   (needs HF_TOKEN with write access)
 #   UPLOAD      [1]; 0 trains without the exporter / upload monitor (smoke tests)   LOG_INTERVAL [100]
-#   ACTION_MIN_STD [0.005] minimum std per action dim (--data.action-min-std; 0 = off). pi05_b1k normalizes with
-#               mean/std, and action dim 6 (torso joint 4) has std 4.5e-5. Runs started without it resume with 0.
-#   ACTION_MIN_RANGE [0] minimum q01..q99 range per action dim (--data.action-min-quantile-range). No effect on
-#               training (mean/std normalization); it only changes the stored q01/q99, so resume with the start value
+#   QUANTILE_NORM [1] quantile normalization of states and actions (--data.quantile-norm); 0 = mean/std, which every
+#               run before 2026-11-26 used (nov15-*, resume those with QUANTILE_NORM=0 ACTION_MIN_RANGE=0 ACTION_MIN_STD=0)
+#   ACTION_MIN_RANGE [0.01 with quantile, else 0] minimum q01..q99 range per action dim (--data.action-min-quantile-range;
+#               action dim 6, torso joint 4, has range 1e-4)
+#   ACTION_MIN_STD [0.005 with mean/std, else 0] minimum std per action dim (--data.action-min-std; dim 6 std 4.5e-5)
+#               Each floor only matters under its normalization; resuming needs the values the run started with.
 set -euo pipefail
 OPENPI_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 : "${DATASET:?set DATASET to the LeRobot v3 root}"
@@ -104,8 +106,11 @@ train() {
     local flags=()
     if compgen -G "$CKPT/[0-9]*" > /dev/null; then flags+=(--resume); elif [[ -d $CKPT ]]; then flags+=(--overwrite); fi
     local norm=()
-    [[ ${ACTION_MIN_STD:-0.005} == 0 ]] || norm+=(--data.action-min-std="${ACTION_MIN_STD:-0.005}")
-    [[ ${ACTION_MIN_RANGE:-0} == 0 ]] || norm+=(--data.action-min-quantile-range="$ACTION_MIN_RANGE")
+    local quantile=${QUANTILE_NORM:-1} min_range min_std
+    if [[ $quantile == 1 ]]; then norm+=(--data.quantile-norm); min_range=${ACTION_MIN_RANGE:-0.01} min_std=${ACTION_MIN_STD:-0}
+    else min_range=${ACTION_MIN_RANGE:-0} min_std=${ACTION_MIN_STD:-0.005}; fi
+    [[ $min_range == 0 ]] || norm+=(--data.action-min-quantile-range="$min_range")
+    [[ $min_std == 0 ]] || norm+=(--data.action-min-std="$min_std")
     local uploader='' rc=0
     if [[ ${UPLOAD:-1} == 1 ]]; then upload & uploader=$!; fi
     echo "[$(date -u +%FT%TZ)] $RUN: training (${flags[*]:-fresh start}); exporter + uploader pid $uploader -> $HF_REPO"

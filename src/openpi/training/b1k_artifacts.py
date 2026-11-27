@@ -72,6 +72,22 @@ def save_metadata(assets_dir: Any, metadata: dict[str, Any]) -> None:
     (path / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 
 
+# How states and actions are normalized: "mean_std" (z-score) or "quantile" (q01..q99 -> [-1, 1]). Metadata without
+# the key predates it, when B1K training always used mean/std.
+NORMALIZATIONS = ("mean_std", "quantile")
+
+
+def normalization_name(use_quantile_norm: bool) -> str:
+    return "quantile" if use_quantile_norm else "mean_std"
+
+
+def uses_quantile_norm(metadata: dict[str, Any]) -> bool:
+    name = metadata.get("normalization", "mean_std")
+    if name not in NORMALIZATIONS:
+        raise ValueError(f"Unknown normalization {name!r} in BEHAVIOR metadata (expected one of {NORMALIZATIONS})")
+    return name == "quantile"
+
+
 def norm_metadata(representation: dict[str, Any]) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "action_representation": representation}
 
@@ -106,6 +122,7 @@ def inference_metadata(
         settle_steps=settle_steps,
         val_split=val_split,
         model_type=model_config.model_type.value,
+        normalization=normalization_name(bool(getattr(data_config, "use_quantile_norm", False))),
         # tuples become lists so the record equals its JSON round trip
         model={field: (list(value) if isinstance(value, tuple) else value)
                for field in MODEL_FIELDS if hasattr(model_config, field) for value in [getattr(model_config, field)]},
